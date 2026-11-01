@@ -294,7 +294,13 @@ impl Player {
                         continue;
                     }
                     if let Some(p) = prev {
-                        events[p].2 = events[i].0;
+                        // Trim only when it actually overlaps. Assigning the
+                        // next start unconditionally would *stretch* every
+                        // short note up to the following one on the same key,
+                        // which leaves the key held long after the note ended.
+                        if events[p].2 > events[i].0 {
+                            events[p].2 = events[i].0;
+                        }
                     }
                     prev = Some(i);
                     prev_tick = Some(tick);
@@ -623,6 +629,34 @@ mod tests {
         assert!(
             log.iter().any(|l| l.starts_with("[RELEASE]")),
             "the collapsed note must still be released"
+        );
+    }
+
+    #[test]
+    fn a_short_note_is_not_stretched_to_the_next_one() {
+        // A 100 ms note followed by the same key at 500 ms must be released at
+        // 100 ms. Assigning the next start unconditionally held the key for
+        // 400 ms longer than the note.
+        let notes = vec![note(60, 0.0, 100.0), note(60, 500.0, 100.0)];
+        let log = play_notes(notes, 0);
+        assert_eq!(presses(&log), 2);
+        // The log is chronological, so a RELEASE must appear before the second
+        // PRESS. If the note were stretched to 500 ms they would be adjacent
+        // the other way round.
+        let second_press = log
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| l.starts_with("[PRESS]"))
+            .nth(1)
+            .map(|(i, _)| i)
+            .expect("two presses");
+        let released_before = log[..second_press]
+            .iter()
+            .filter(|l| l.starts_with("[RELEASE]"))
+            .count();
+        assert_eq!(
+            released_before, 1,
+            "first note must be released before the second press"
         );
     }
 
