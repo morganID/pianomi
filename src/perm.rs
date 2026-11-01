@@ -89,7 +89,7 @@ mod ax {
         unsafe {
             let key = CFStringCreateWithCString(
                 std::ptr::null(),
-                b"AXTrustedCheckOptionPrompt\0".as_ptr() as *const i8,
+                c"AXTrustedCheckOptionPrompt".as_ptr(),
                 UTF8,
             );
             if key.is_null() {

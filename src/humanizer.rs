@@ -33,7 +33,7 @@ impl Humanizer {
     }
 
     /// Mutates `notes` in place, applying speed scaling and humanization.
-    pub fn apply(&self, notes: &mut Vec<Note>) {
+    pub fn apply(&self, notes: &mut [Note]) {
         // 1. Speed scaling — everything is relative to the original timeline.
         if self.speed != 1.0 {
             for n in notes.iter_mut() {

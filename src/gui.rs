@@ -142,7 +142,7 @@ impl Ui {
                 let n = song.notes.len();
                 self.song = Some(song);
                 self.m_song
-                    .set_text(&format!("Song: {} ({} notes)", self.file_name, n));
+                    .set_text(format!("Song: {} ({} notes)", self.file_name, n));
                 self.m_play.set_enabled(true);
                 self.set_status(&format!("Loaded {}", self.file_name));
             }
@@ -527,7 +527,7 @@ fn main() -> anyhow::Result<()> {
     let m_out_keys = CheckMenuItem::with_id("outkeys", "Keyboard (Roblox piano)", true, true, None);
     let m_out_virt = CheckMenuItem::with_id(
         "outvirt",
-        &format!("Virtual MIDI port \"{}\"", midi_out::DEFAULT_VIRTUAL_NAME),
+        format!("Virtual MIDI port \"{}\"", midi_out::DEFAULT_VIRTUAL_NAME),
         true,
         false,
         None,

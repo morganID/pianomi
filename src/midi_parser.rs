@@ -205,6 +205,10 @@ struct RawNote {
     velocity: u8,
 }
 
+/// Notes currently held, keyed by `(track, channel, pitch)`; each entry is a
+/// FIFO queue of `(start tick, velocity)`.
+type OpenNotes = HashMap<(u32, u8, u8), VecDeque<(u64, u8)>>;
+
 /// Parse a MIDI file at `path`.
 pub fn parse_midi(path: &Path) -> Result<Song> {
     let data =
@@ -266,12 +270,15 @@ pub fn parse_midi(path: &Path) -> Result<Song> {
     // note-off. Popping the most recent one instead swaps the durations of
     // overlapping same-pitch notes (the earlier note gets the later note's
     // length and vice versa).
-    let mut open: HashMap<(u32, u8, u8), VecDeque<(u64, u8)>> = HashMap::new();
+    // (track, channel, pitch) -> queue of (start tick, velocity) for the notes
+    // currently held on that key. FIFO, so overlapping same-pitch notes keep
+    // their own durations.
+    let mut open: OpenNotes = HashMap::new();
     let mut raw: Vec<RawNote> = Vec::new();
 
     /// Close one open note for `key` at `tick`, recording it if one was open.
     fn close_note(
-        open: &mut HashMap<(u32, u8, u8), VecDeque<(u64, u8)>>,
+        open: &mut OpenNotes,
         key: (u32, u8, u8),
         tick: u64,
         raw: &mut Vec<RawNote>,

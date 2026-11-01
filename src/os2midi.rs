@@ -13,7 +13,7 @@
 //!   - Tempo `bpm` (the caller passes the real song tempo, e.g. 125)
 //!   - 1 step = 1 sixteenth note -> 120 ticks per step at PPQ 480
 //!     (Online Sequencer's grid unit is a 1/4 beat; treating a step as an
-//!      eighth note makes everything play back at half speed.)
+//!     eighth note makes everything play back at half speed.)
 //!   - Notes with duration <= 0 are skipped.
 //!
 //! This is a Rust port of `os2midi.py` so the GUI can convert pasted data
