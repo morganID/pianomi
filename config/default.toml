@@ -359,14 +359,17 @@ loop_gap_ms = 800
 
 # How a black key (a sharp like "!" or "S") is delivered.
 #
+#   "key"  — real Shift down, the key, Shift up, scoped to this one note.
+#            Roblox's Virtual Piano reads UserInputService:IsKeyDown(LeftShift),
+#            which only ever sees a *real* modifier key, never an event flag —
+#            so this is the default. The key event also carries the Shift flag
+#            and the typed character, so nothing is lost.
 #   "char" — one event: the base keycode with the Shift FLAG and the literal
-#            character attached. Nothing global changes, one event per note.
-#            Use this when the game reacts to the typed character.
-#   "key"  — three events: real Shift down, key, Shift up. Use this when the
-#            game asks its own input state "is Shift held?" (Roblox
-#            UserInputService:IsKeyDown), which never sees an event flag.
+#            character attached, no real modifier. Only use this for a game
+#            that reacts to the typed character; under Roblox it delivers every
+#            sharp as the natural below it.
 #
 # Both avoid the old bug where Shift stayed down for the whole note and turned
 # every white key pressed in the meantime into a sharp.
-shift_mode = "char"
+shift_mode = "key"
 

@@ -112,6 +112,7 @@ pianomi play -f song.mid --config my-config.toml
 | `--channel` | all | Restrict to one MIDI channel (1-16) |
 | `--transpose` | `0` | Semitones to shift every note |
 | `--loops` | `1` | Repeat count |
+| `--shift-mode` | from config (`key`) | `key` = real Shift per note, `char` = Shift flag + typed character only |
 | `--dry-run` | off | Print the whole event schedule instead of pressing keys — instant, not real-time |
 | `--midi-out [NAME]` | off | Send MIDI instead of keystrokes; no value publishes a virtual port |
 
@@ -184,32 +185,65 @@ the black key above `w` is `Ctrl+w`, not `Ctrl+W`.
 
 Together that covers every note, so a song spanning F2–A7 plays in full.
 
-### How sharps are sent (no Shift key)
+### How sharps are sent
 
-A black key is the same physical key as the white note below it. Rather than
-pressing the real Shift key, the player posts a single event whose *own*
-modifier flag is set — `8` with `kCGEventFlagMaskShift` plus the literal
-character `"*"`. The app sees a normal `*` keystroke, the system-wide modifier
-state is never touched, and there is exactly one event per note (no races at
-speed, and no chance of a stray Shift turning a natural into a sharp).
+A black key is the same physical key as the white note below it, so the game has
+to be told a sharp was meant. There are two ways to say it, and which one works
+depends on how the experience reads input.
 
-Verify it yourself:
+Roblox's Virtual Piano reads `UserInputService:IsKeyDown(LeftShift)` — the
+**global** modifier state. An event flag is invisible to that call, so the real
+Shift key has to go down. The default (`shift_mode = "key"`) posts Shift down,
+the key, Shift up, scoped to that one note, and *also* stamps the Shift flag and
+the typed character on the key event itself so a game that reads either of those
+still works.
+
+Getting this wrong is subtle and it used to be the default bug: with the flag
+alone the app *looks* like it is pressing `Shift+P`, but the game sees a plain
+`P`, so **every sharp plays as the natural a semitone below**. In a piece in
+B♭ major that rewrites every E♭, B♭ and A♭, and turns every minor chord into a
+major one — which is exactly what "sounds nothing like the original" means.
+
+Check what actually reaches the OS:
 
 ```bash
-cargo run --release --example probe_keys
+cargo run --release --example release_probe          # key mode
+cargo run --release --example release_probe char     # flag-only, for comparison
 ```
 
-### If the game ignores the flag
+It installs an event tap and reports, for every key-down, whether a real Shift
+was held at that instant:
 
-`player.shift_mode` in the config selects how a sharp is delivered:
+```text
+modifier (FlagsChanged) events seen: 36
+key-downs with a real Shift held:    4   <- IsKeyDown sees these
+key-downs with the Shift flag only:  0
+key-downs with a real Ctrl held:     5   <- IsKeyDown sees these
+```
 
-| Value | Events per sharp | Use when |
+In `char` mode the first count is `0` and the second is `4`: the flag is set,
+the global state never changes.
+
+| `player.shift_mode` | What it posts | Use when |
 | --- | --- | --- |
-| `"char"` (default) | 1 — base keycode + Shift flag + literal character | the game reacts to the typed character |
-| `"key"` | 3 — real Shift down, key, Shift up | the game asks its own input state (`UserInputService:IsKeyDown`) |
+| `"key"` (default) | real Shift down, key, Shift up — plus the flag and the character | the game asks `IsKeyDown` (Roblox Virtual Piano) |
+| `"char"` | one event: base keycode + Shift flag + typed character, no real modifier | the game reacts to the typed character only |
 
-Both scope the modifier to a single event, so neither can leak into the next
-note. The same choice applies to the Ctrl layer.
+Override it per run without touching the config:
+
+```bash
+pianomi play -f song.mid --shift-mode key
+pianomi play -f song.mid --shift-mode char
+```
+
+The startup banner prints which one is active:
+
+```text
+Sharp keys   : key — real Shift per note (IsKeyDown)
+```
+
+Both modes scope the modifier to a single event, so neither can leak into the
+next note. The same choice applies to the Ctrl layer.
 
 Edit `config/default.toml` (or your own `--config` file) to match the exact
 layout your Roblox piano experience expects. Add more `[[keyboard.keys]]`

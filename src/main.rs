@@ -54,6 +54,11 @@ enum Commands {
         #[arg(short = 'l', long, default_value_t = 1)]
         loops: u32,
 
+        /// How sharp (black) keys are sent: "key" (real Shift, needed by
+        /// Roblox's IsKeyDown) or "char" (Shift flag + typed character only).
+        #[arg(long, value_name = "MODE")]
+        shift_mode: Option<String>,
+
         /// Don't press any keys — just print the scheduled events.
         #[arg(long)]
         dry_run: bool,
@@ -107,10 +112,11 @@ fn main() -> Result<()> {
             channel,
             transpose,
             loops,
+            shift_mode,
             dry_run,
             midi_out,
         } => cmd_play(
-            file, humanize, speed, config, channel, transpose, loops, dry_run, midi_out,
+            file, humanize, speed, config, channel, transpose, loops, shift_mode, dry_run, midi_out,
         ),
         Commands::ListMappings { config } => cmd_list(config),
         Commands::Info {
@@ -153,12 +159,27 @@ fn cmd_play(
     channel: Option<u8>,
     transpose: i8,
     loops: u32,
+    shift_mode: Option<String>,
     dry_run: bool,
     midi_out: Option<String>,
 ) -> Result<()> {
     let mut cfg = Config::load(config.as_deref())?;
     if transpose != 0 {
         cfg.keyboard.transpose = transpose;
+    }
+    if let Some(mode) = shift_mode {
+        // Validate through the parser so a typo does not silently fall back.
+        let parsed = pianomi::keycode::parse_shift_mode(&mode);
+        let canonical = match parsed {
+            pianomi::keycode::ShiftMode::Key => "key",
+            pianomi::keycode::ShiftMode::Char => "char",
+        };
+        if !mode.trim().eq_ignore_ascii_case(canonical) {
+            anyhow::bail!(
+                "unknown --shift-mode {mode:?} (expected \"key\" or \"char\")"
+            );
+        }
+        cfg.player.shift_mode = canonical.to_string();
     }
 
     let mode = if midi_out.is_some() {
@@ -186,6 +207,12 @@ fn cmd_play(
             cfg.game.window_title
         );
         println!("Config keys  : {} mapped", cfg.keyboard.keys.len());
+        let sm = pianomi::keycode::parse_shift_mode(&cfg.player.shift_mode);
+        let what = match sm {
+            pianomi::keycode::ShiftMode::Key => "real Shift per note (IsKeyDown)",
+            pianomi::keycode::ShiftMode::Char => "Shift flag + typed char only",
+        };
+        println!("Sharp keys   : {} — {}", cfg.player.shift_mode, what);
     }
 
     let mut song = parse_midi(&file)?;

@@ -50,6 +50,17 @@ pub const SHIFT_VK: u32 = 0x38;
 /// The extended octaves of the in-game piano are reached with Ctrl.
 pub const CTRL_VK: u32 = 0x3B;
 
+#[cfg(target_os = "macos")]
+use core_graphics::event::CGEventFlags;
+
+/// The Shift bit in a `CGEvent`'s flags field.
+#[cfg(target_os = "macos")]
+pub const SHIFT_FLAG: CGEventFlags = CGEventFlags::CGEventFlagShift;
+
+/// The Control bit in a `CGEvent`'s flags field.
+#[cfg(target_os = "macos")]
+pub const CTRL_FLAG: CGEventFlags = CGEventFlags::CGEventFlagControl;
+
 /// Human-readable description of how keys are dispatched on this platform.
 /// Printed at startup so it is obvious whether a build contains the crash fix.
 pub fn dispatch_mode() -> &'static str {
@@ -271,7 +282,10 @@ fn char_key(c: char) -> Option<Key> {
 /// If the experience asks Roblox's own input state instead of reading the
 /// event (`UserInputService:IsKeyDown(LeftShift)`), the flag is invisible to it
 /// and [`ShiftMode::Key`] is needed: real Shift, but pressed and released
-/// around this single event rather than held for the whole note.
+/// around this single event rather than held for the whole note. `Key` also
+/// stamps the flag and the typed character, so it is a superset of `Char` and
+/// is the default — Roblox's Virtual Piano reads `IsKeyDown`, so `Char` alone
+/// delivers every sharp as the natural below it.
 ///
 /// Returns `Ok(false)` when the label has no keycode on this layout.
 #[cfg(target_os = "macos")]
@@ -302,17 +316,21 @@ pub fn post_key(label: &str, down: bool, mode: ShiftMode, ctrl: bool) -> anyhow:
             // Real modifiers, but scoped to this one event: down, key, up.
             // Never held across the note, so they cannot bleed into a later key.
             if ctrl {
-                mac_post::post(CTRL_VK as u16, true, false, false, None)?;
+                mac_post::post_modifier(CTRL_VK as u16, CTRL_FLAG, true)?;
             }
             if shifted {
-                mac_post::post(SHIFT_VK as u16, true, false, false, None)?;
+                mac_post::post_modifier(SHIFT_VK as u16, SHIFT_FLAG, true)?;
             }
-            mac_post::post(vk, down, false, false, None)?;
+            // The key event also carries the flag and the typed character.
+            // Roblox's Virtual Piano asks `IsKeyDown(LeftShift)` and only sees
+            // the real key above; any game that reads the modifier flag or the
+            // typed character instead sees those here. One event serves both.
+            mac_post::post(vk, down, shifted, ctrl, ch)?;
             if shifted {
-                mac_post::post(SHIFT_VK as u16, false, false, false, None)?;
+                mac_post::post_modifier(SHIFT_VK as u16, SHIFT_FLAG, false)?;
             }
             if ctrl {
-                mac_post::post(CTRL_VK as u16, false, false, false, None)?;
+                mac_post::post_modifier(CTRL_VK as u16, CTRL_FLAG, false)?;
             }
         }
     }
@@ -333,15 +351,17 @@ pub enum ShiftMode {
     /// Three events: real Shift down, key, Shift up — the same thing a human
     /// types. Needed when the game asks "is Shift held?" through its own input
     /// state (Roblox `UserInputService:IsKeyDown`), which never sees a flag.
+    /// The key event still carries the flag and the typed character, so this
+    /// also covers anything `Char` covers.
     Key,
 }
 
 /// Parse `player.shift_mode` from the config; anything unrecognised falls back
-/// to [`ShiftMode::Char`].
+/// to [`ShiftMode::Key`], which is the one Roblox's Virtual Piano needs.
 pub fn parse_shift_mode(s: &str) -> ShiftMode {
     match s.trim().to_ascii_lowercase().as_str() {
-        "key" | "shift" | "real" => ShiftMode::Key,
-        _ => ShiftMode::Char,
+        "char" | "flag" | "unicode" => ShiftMode::Char,
+        _ => ShiftMode::Key,
     }
 }
 
@@ -400,5 +420,50 @@ mod mac_post {
 
         ev.post(CGEventTapLocation::HID);
         Ok(())
+    }
+
+    /// Press or release a modifier key itself.
+    ///
+    /// A modifier key event carries the *new* modifier state in its flags
+    /// field, and that field is what the system uses to update the global
+    /// modifier state. Posting `0x38` with empty flags is therefore a Shift
+    /// *release*, not a press: the event is delivered, but `IsKeyDown` never
+    /// changes. So the flag has to be set on the down event.
+    pub fn post_modifier(vk: u16, flag: CGEventFlags, down: bool) -> anyhow::Result<()> {
+        let ev = CGEvent::new_keyboard_event(source()?, vk, down)
+            .map_err(|_| anyhow::anyhow!("could not create a CGEvent"))?;
+        ev.set_flags(if down { flag } else { CGEventFlags::empty() });
+        ev.post(CGEventTapLocation::HID);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Roblox's Virtual Piano asks `IsKeyDown(LeftShift)`, which never sees an
+    /// event flag, so a sharp only plays correctly when a real Shift goes down.
+    /// Anything unrecognised must therefore land on `Key`, not `Char`.
+    #[test]
+    fn shift_mode_defaults_to_the_one_roblox_needs() {
+        assert_eq!(parse_shift_mode("key"), ShiftMode::Key);
+        assert_eq!(parse_shift_mode("KEY"), ShiftMode::Key);
+        assert_eq!(parse_shift_mode(""), ShiftMode::Key);
+        assert_eq!(parse_shift_mode("nonsense"), ShiftMode::Key);
+    }
+
+    #[test]
+    fn char_mode_is_still_reachable() {
+        assert_eq!(parse_shift_mode("char"), ShiftMode::Char);
+        assert_eq!(parse_shift_mode(" char "), ShiftMode::Char);
+    }
+
+    /// The shipped config must match the default the parser assumes; a stale
+    /// `shift_mode = "char"` in the file would silently undo the fix.
+    #[test]
+    fn builtin_config_uses_key_mode() {
+        let cfg = crate::config::Config::load(None).expect("builtin config");
+        assert_eq!(parse_shift_mode(&cfg.player.shift_mode), ShiftMode::Key);
     }
 }

@@ -111,7 +111,9 @@ fn default_u64_800() -> u64 {
     800
 }
 fn default_shift_mode() -> String {
-    "char".to_string()
+    // Roblox's Virtual Piano asks `IsKeyDown(LeftShift)`, which never sees an
+    // event flag, so the real key has to go down.
+    "key".to_string()
 }
 
 impl Default for HumanizeConfig {

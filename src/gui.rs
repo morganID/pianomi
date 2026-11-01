@@ -516,8 +516,12 @@ fn main() -> anyhow::Result<()> {
 
     let sub_sh = Submenu::with_id("sub_sh", "Sharp keys", true);
     let mut m_sharp = Vec::new();
-    for (val, label) in [("char", "Character (no Shift)"), ("key", "Real Shift key")] {
-        let checked = val == "char";
+    let current_sharp = cfg.player.shift_mode.clone();
+    for (val, label) in [
+        ("key", "Real Shift key (Roblox)"),
+        ("char", "Character only (no Shift)"),
+    ] {
+        let checked = val == current_sharp;
         let it = CheckMenuItem::with_id(format!("sm{}", val), label, true, checked, None);
         sub_sh.append(&it)?;
         m_sharp.push((val.to_string(), it));
