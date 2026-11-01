@@ -282,7 +282,15 @@ impl Player {
                 for &i in idxs {
                     let tick = events[i].0.round() as u64;
                     if prev_tick == Some(tick) {
-                        drop[i] = true; // same key, same instant: one press
+                        // Same key, same instant: one physical press. Keep the
+                        // longest of the collapsed durations so a stray short
+                        // duplicate cannot cut the real note off early.
+                        if let Some(p) = prev {
+                            if events[i].2 > events[p].2 {
+                                events[p].2 = events[i].2;
+                            }
+                        }
+                        drop[i] = true;
                         continue;
                     }
                     if let Some(p) = prev {
@@ -601,6 +609,24 @@ mod tests {
     }
 
     #[test]
+    fn collapsed_duplicates_keep_the_longest_duration() {
+        // Spring_Thief has F5 note-on'd three times on one tick: 120, 120 and
+        // 479 ms. One press, and it must last the 479 ms, not the first 120.
+        let notes = vec![
+            note(77, 0.0, 120.0),
+            note(77, 0.0, 120.0),
+            note(77, 0.0, 479.0),
+        ];
+        let log = play_notes(notes, 0);
+        assert_eq!(presses(&log), 1);
+        // The release is scheduled from the longest end, rounded to 479 ms.
+        assert!(
+            log.iter().any(|l| l.starts_with("[RELEASE]")),
+            "the collapsed note must still be released"
+        );
+    }
+
+    #[test]
     fn a_note_outlasting_the_next_one_is_trimmed_not_dropped() {
         // 0..2000 overlaps the note at 1000. The first must be cut at 1000 so
         // the second can sound.
@@ -627,8 +653,12 @@ mod tests {
     #[test]
     fn velocity_never_lengthens_a_note() {
         // Lengthening pushed loud notes past the next one on the same key,
-        // which dropped that next note.
-        let cfg = Config::load(None).expect("builtin config");
+        // which dropped that next note. Jitter is zeroed so only the velocity
+        // term is under test.
+        let mut cfg = Config::load(None).expect("builtin config");
+        cfg.humanize.timing_variation_ms = 0.0;
+        cfg.humanize.duration_variation_ms = 0.0;
+        cfg.humanize.chord_delay_ms = 0.0;
         let humanizer = Humanizer::new(100, 1.0, cfg.humanize.clone());
         let mut ns = vec![
             Note {
