@@ -1,0 +1,25 @@
+# Rust build output
+/target
+**/*.rs.bk
+
+# macOS app bundle (built by build-app.sh)
+/Pianomi.app
+*.app
+
+# Local tooling / session data
+.workbuddy-ai/
+.DS_Store
+
+# Audio renders and generated verification output
+*.wav
+*.aiff
+*.mp3
+verify_result.json
+
+# Song data — copyrighted material, keep it out of the repo
+*.mid
+*.midi
+*.bak
+
+# Local overrides
+my-config.toml

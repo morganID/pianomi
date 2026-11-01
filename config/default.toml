@@ -1,0 +1,367 @@
+# ============================================================================
+# Default configuration for pianomi
+# ---------------------------------------------------------------------------
+# Maps MIDI note numbers (60 = middle C / C4) to the keyboard keys used by the
+# Roblox "Virtual Piano" experience (mapping sourced from the well-known
+# Virtual-Piano-Roblox-Player project). Edit freely or pass --config.
+#
+# BLACK KEYS USE SHIFT: a sharp is the SAME physical key as the white note
+# one semitone below, played with Shift held. So "!" = Shift+1, "Q" = Shift+q,
+# "@" = Shift+2, etc. The player derives the Shift modifier automatically.
+#
+# Range covered: A0 (21) .. C8 (108) — all 88 keys.
+#   plain / Shift : C2 (36) .. C7 (96)
+#   Ctrl + key    : A0 (21) .. B1 (35)  and  C#7 (97) .. C8 (108)
+# ============================================================================
+
+[game]
+name = "Roblox Virtual Piano"
+# Only used for display / logging.
+window_title = "Roblox"
+
+# ---------------------------------------------------------------------------
+# Keyboard mapping (authoritative Virtual Piano Roblox layout)
+# ---------------------------------------------------------------------------
+[[keyboard.keys]]
+key = "1"
+note = 36   # C2
+[[keyboard.keys]]
+key = "!"
+note = 37   # C#2
+[[keyboard.keys]]
+key = "2"
+note = 38   # D2
+[[keyboard.keys]]
+key = "@"
+note = 39   # D#2
+[[keyboard.keys]]
+key = "3"
+note = 40   # E2
+[[keyboard.keys]]
+key = "4"
+note = 41   # F2
+[[keyboard.keys]]
+key = "$"
+note = 42   # F#2
+[[keyboard.keys]]
+key = "5"
+note = 43   # G2
+[[keyboard.keys]]
+key = "%"
+note = 44   # G#2
+[[keyboard.keys]]
+key = "6"
+note = 45   # A2
+[[keyboard.keys]]
+key = "^"
+note = 46   # A#2
+[[keyboard.keys]]
+key = "7"
+note = 47   # B2
+[[keyboard.keys]]
+key = "8"
+note = 48   # C3
+[[keyboard.keys]]
+key = "*"
+note = 49   # C#3
+[[keyboard.keys]]
+key = "9"
+note = 50   # D3
+[[keyboard.keys]]
+key = "("
+note = 51   # D#3
+[[keyboard.keys]]
+key = "0"
+note = 52   # E3
+[[keyboard.keys]]
+key = "q"
+note = 53   # F3
+[[keyboard.keys]]
+key = "Q"
+note = 54   # F#3
+[[keyboard.keys]]
+key = "w"
+note = 55   # G3
+[[keyboard.keys]]
+key = "W"
+note = 56   # G#3
+[[keyboard.keys]]
+key = "e"
+note = 57   # A3
+[[keyboard.keys]]
+key = "E"
+note = 58   # A#3
+[[keyboard.keys]]
+key = "r"
+note = 59   # B3
+[[keyboard.keys]]
+key = "t"
+note = 60   # C4
+[[keyboard.keys]]
+key = "T"
+note = 61   # C#4
+[[keyboard.keys]]
+key = "y"
+note = 62   # D4
+[[keyboard.keys]]
+key = "Y"
+note = 63   # D#4
+[[keyboard.keys]]
+key = "u"
+note = 64   # E4
+[[keyboard.keys]]
+key = "i"
+note = 65   # F4
+[[keyboard.keys]]
+key = "I"
+note = 66   # F#4
+[[keyboard.keys]]
+key = "o"
+note = 67   # G4
+[[keyboard.keys]]
+key = "O"
+note = 68   # G#4
+[[keyboard.keys]]
+key = "p"
+note = 69   # A4
+[[keyboard.keys]]
+key = "P"
+note = 70   # A#4
+[[keyboard.keys]]
+key = "a"
+note = 71   # B4
+[[keyboard.keys]]
+key = "s"
+note = 72   # C5
+[[keyboard.keys]]
+key = "S"
+note = 73   # C#5
+[[keyboard.keys]]
+key = "d"
+note = 74   # D5
+[[keyboard.keys]]
+key = "D"
+note = 75   # D#5
+[[keyboard.keys]]
+key = "f"
+note = 76   # E5
+[[keyboard.keys]]
+key = "g"
+note = 77   # F5
+[[keyboard.keys]]
+key = "G"
+note = 78   # F#5
+[[keyboard.keys]]
+key = "h"
+note = 79   # G5
+[[keyboard.keys]]
+key = "H"
+note = 80   # G#5
+[[keyboard.keys]]
+key = "j"
+note = 81   # A5
+[[keyboard.keys]]
+key = "J"
+note = 82   # A#5
+[[keyboard.keys]]
+key = "k"
+note = 83   # B5
+[[keyboard.keys]]
+key = "l"
+note = 84   # C6
+[[keyboard.keys]]
+key = "L"
+note = 85   # C#6
+[[keyboard.keys]]
+key = "z"
+note = 86   # D6
+[[keyboard.keys]]
+key = "Z"
+note = 87   # D#6
+[[keyboard.keys]]
+key = "x"
+note = 88   # E6
+[[keyboard.keys]]
+key = "c"
+note = 89   # F6
+[[keyboard.keys]]
+key = "C"
+note = 90   # F#6
+[[keyboard.keys]]
+key = "v"
+note = 91   # G6
+[[keyboard.keys]]
+key = "V"
+note = 92   # G#6
+[[keyboard.keys]]
+key = "b"
+note = 93   # A6
+[[keyboard.keys]]
+key = "B"
+note = 94   # A#6
+[[keyboard.keys]]
+key = "n"
+note = 95   # B6
+[[keyboard.keys]]
+key = "m"
+note = 96   # C7
+
+# ---------------------------------------------------------------------------
+# Extended octaves — Ctrl + key
+# ---------------------------------------------------------------------------
+# The in-game piano is 88 keys. The 27 keys outside C2..C7 are drawn dimmed
+# because they need Ctrl held; the keys themselves are the same 36 QWERTY
+# keys, walked chromatically from the start of the list.
+#
+#   left   A0 (21) .. B1 (35)  ->  Ctrl + 1 2 3 4 5 6 7 8 9 0 q w e r t
+#   right  C#7 (97) .. C8 (108) ->  Ctrl + y u i o p a s d f g h j
+#
+# Black keys in this layer are NOT Shift+key: every semitone gets its own
+# key, so the label is always the plain character (e.g. Ctrl+w, not Ctrl+W).
+
+[[keyboard.keys]]
+key = "1"
+note = 21   # A0
+mods = "ctrl"
+[[keyboard.keys]]
+key = "2"
+note = 22   # A#0
+mods = "ctrl"
+[[keyboard.keys]]
+key = "3"
+note = 23   # B0
+mods = "ctrl"
+[[keyboard.keys]]
+key = "4"
+note = 24   # C1
+mods = "ctrl"
+[[keyboard.keys]]
+key = "5"
+note = 25   # C#1
+mods = "ctrl"
+[[keyboard.keys]]
+key = "6"
+note = 26   # D1
+mods = "ctrl"
+[[keyboard.keys]]
+key = "7"
+note = 27   # D#1
+mods = "ctrl"
+[[keyboard.keys]]
+key = "8"
+note = 28   # E1
+mods = "ctrl"
+[[keyboard.keys]]
+key = "9"
+note = 29   # F1
+mods = "ctrl"
+[[keyboard.keys]]
+key = "0"
+note = 30   # F#1
+mods = "ctrl"
+[[keyboard.keys]]
+key = "q"
+note = 31   # G1
+mods = "ctrl"
+[[keyboard.keys]]
+key = "w"
+note = 32   # G#1
+mods = "ctrl"
+[[keyboard.keys]]
+key = "e"
+note = 33   # A1
+mods = "ctrl"
+[[keyboard.keys]]
+key = "r"
+note = 34   # A#1
+mods = "ctrl"
+[[keyboard.keys]]
+key = "t"
+note = 35   # B1
+mods = "ctrl"
+
+[[keyboard.keys]]
+key = "y"
+note = 97   # C#7
+mods = "ctrl"
+[[keyboard.keys]]
+key = "u"
+note = 98   # D7
+mods = "ctrl"
+[[keyboard.keys]]
+key = "i"
+note = 99   # D#7
+mods = "ctrl"
+[[keyboard.keys]]
+key = "o"
+note = 100   # E7
+mods = "ctrl"
+[[keyboard.keys]]
+key = "p"
+note = 101   # F7
+mods = "ctrl"
+[[keyboard.keys]]
+key = "a"
+note = 102   # F#7
+mods = "ctrl"
+[[keyboard.keys]]
+key = "s"
+note = 103   # G7
+mods = "ctrl"
+[[keyboard.keys]]
+key = "d"
+note = 104   # G#7
+mods = "ctrl"
+[[keyboard.keys]]
+key = "f"
+note = 105   # A7
+mods = "ctrl"
+[[keyboard.keys]]
+key = "g"
+note = 106   # A#7
+mods = "ctrl"
+[[keyboard.keys]]
+key = "h"
+note = 107   # B7
+mods = "ctrl"
+[[keyboard.keys]]
+key = "j"
+note = 108   # C8
+mods = "ctrl"
+
+# Transpose applied to every note (semitones) before lookup. Positive = up.
+# The whole 88-key range is mapped, so songs spanning F2(41)..A7(105) such as
+# "Spring Thief" play in full. Only notes outside A0..C8 are skipped.
+keyboard.transpose = 0
+
+# ---------------------------------------------------------------------------
+# Humanization
+# ---------------------------------------------------------------------------
+[humanize]
+timing_variation_ms = 35
+duration_variation_ms = 25
+chord_delay_ms = 18
+use_velocity_for_duration = true
+
+# ---------------------------------------------------------------------------
+# Player
+# ---------------------------------------------------------------------------
+[player]
+start_delay_ms = 3000
+min_hold_ms = 30
+tick_ms = 1
+loop_gap_ms = 800
+
+# How a black key (a sharp like "!" or "S") is delivered.
+#
+#   "char" — one event: the base keycode with the Shift FLAG and the literal
+#            character attached. Nothing global changes, one event per note.
+#            Use this when the game reacts to the typed character.
+#   "key"  — three events: real Shift down, key, Shift up. Use this when the
+#            game asks its own input state "is Shift held?" (Roblox
+#            UserInputService:IsKeyDown), which never sees an event flag.
+#
+# Both avoid the old bug where Shift stayed down for the whole note and turned
+# every white key pressed in the meantime into a sharp.
+shift_mode = "char"
+

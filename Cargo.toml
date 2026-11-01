@@ -1,0 +1,57 @@
+[package]
+name = "pianomi"
+version = "0.3.0"
+edition = "2021"
+description = "Play MIDI files into Roblox piano games — keyboard replay or real MIDI output, with humanization (CLI + macOS menu bar app)"
+license = "MIT"
+repository = "https://github.com/morganID/pianomi"
+homepage = "https://github.com/morganID/pianomi"
+readme = "README.md"
+keywords = ["midi", "roblox", "piano", "automation", "music"]
+categories = ["command-line-utilities", "multimedia::audio"]
+
+[lib]
+name = "pianomi"
+path = "src/lib.rs"
+
+[[bin]]
+name = "pianomi"
+path = "src/main.rs"
+
+[[bin]]
+name = "pianomi-gui"
+path = "src/gui.rs"
+
+[dependencies]
+# Fast, allocation-light Standard MIDI File (SMF) parser
+midly = "0.5"
+# Cross-platform (Windows / macOS / Linux) keyboard & mouse simulation
+enigo = "0.6"
+# Pseudo-random numbers for the humanization layer
+rand = "0.8"
+# Ergonomic command-line argument parsing
+clap = { version = "4", features = ["derive"] }
+# Serialization framework for the TOML config
+serde = { version = "1", features = ["derive"] }
+# TOML (de)serialization
+toml = "0.8"
+# Ergonomic error handling
+anyhow = "1"
+# Native tray / menu bar + event loop (macOS status item app)
+tao = "0.30"
+# Cross-platform tray (menu bar) icon
+tray-icon = "0.19"
+# Native menus for the tray
+muda = "0.15"
+# Native file/directory dialogs for the GUI
+rfd = "0.15"
+# MIDI output: publish a virtual port or connect to an existing destination
+# (CoreMIDI on macOS, ALSA on Linux, WinMM on Windows).
+midir = "0.10"
+
+# macOS: post key events with per-event modifier flags, so a sharp never needs
+# the real Shift key to be pressed (see src/keycode.rs).
+[target.'cfg(target_os = "macos")'.dependencies]
+core-graphics = "0.25"
+# Used by examples/probe_keys.rs to pump a run loop while an event tap listens.
+core-foundation = "0.10"
