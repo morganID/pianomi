@@ -107,6 +107,9 @@ pub struct Player {
     stop: Option<Arc<AtomicBool>>,
     /// Key labels we already complained about (avoids log spam).
     warned: HashSet<String>,
+    /// Notes that could not be retriggered because the same key was already
+    /// held (a genuine same-key overlap). Reported at the end of a run.
+    dropped: usize,
     /// Which output path this player drives.
     mode: OutputMode,
     /// Open MIDI connection; `None` when playing to the keyboard, or when
@@ -151,6 +154,7 @@ impl Player {
             warned: HashSet::new(),
             mode,
             midi,
+            dropped: 0,
         })
     }
 
@@ -209,6 +213,14 @@ impl Player {
             self.run(&notes, dry_run)?;
         }
 
+        if self.dropped > 0 {
+            self.log(&format!(
+                "warning: {} note(s) could not be retriggered — the same key was \
+                 already held at that instant.",
+                self.dropped
+            ));
+        }
+
         // Safety: release anything still held.
         self.release_all(dry_run)?;
         Ok(())
@@ -241,6 +253,54 @@ impl Player {
         }
         events.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
 
+        // One physical key can only sound one note at a time.
+        //
+        // Two things break that assumption in real files, and both used to drop
+        // notes silently:
+        //   * the same pitch note-on'd several times on the same tick (pedal or
+        //     export artefacts) — that is one press, not three;
+        //   * a note that outlasts the next note on the same key, which can
+        //     never be retriggered while the first is still held.
+        //
+        // So: collapse notes that would press the same key in the same
+        // millisecond, and trim each surviving note at the next one's start.
+        // Trimming keeps the release *at* the retrigger's tick, and releases are
+        // processed before presses, so the key is always free when the new note
+        // lands.
+        {
+            let mut by_key: HashMap<String, Vec<usize>> = HashMap::new();
+            for (i, (_, target, _)) in events.iter().enumerate() {
+                by_key.entry(target.id()).or_default().push(i);
+            }
+
+            let mut drop = vec![false; events.len()];
+            for idxs in by_key.values() {
+                // `events` is sorted by start time, so each list is already in
+                // ascending start order.
+                let mut prev: Option<usize> = None;
+                let mut prev_tick: Option<u64> = None;
+                for &i in idxs {
+                    let tick = events[i].0.round() as u64;
+                    if prev_tick == Some(tick) {
+                        drop[i] = true; // same key, same instant: one press
+                        continue;
+                    }
+                    if let Some(p) = prev {
+                        events[p].2 = events[i].0;
+                    }
+                    prev = Some(i);
+                    prev_tick = Some(tick);
+                }
+            }
+
+            let mut i = 0usize;
+            events.retain(|_| {
+                let keep = !drop[i];
+                i += 1;
+                keep
+            });
+        }
+
         // Group release events by (rounded) end time for efficient lookup.
         let mut releases: BTreeMap<u64, Vec<Target>> = BTreeMap::new();
         for (_, t, e) in &events {
@@ -268,14 +328,11 @@ impl Player {
                 start.elapsed().as_millis() as u64
             };
 
-            // Press notes whose start time has arrived.
-            while ei < events.len() && (events[ei].0.round() as u64) <= elapsed {
-                let target = &events[ei].1;
-                self.press(target, dry_run)?;
-                ei += 1;
-            }
-
-            // Release notes whose end time has arrived.
+            // Release first, then press. Order matters: a legato repeat is
+            // encoded as note-off and note-on on the *same* key at the same
+            // tick, so pressing before releasing would find the key still held,
+            // suppress the press, and then release it — the note would never
+            // sound at all. Releasing first frees the key and the repeat lands.
             let due: Vec<(u64, Vec<Target>)> = releases
                 .range(..=elapsed)
                 .map(|(t, v)| (*t, v.clone()))
@@ -287,6 +344,13 @@ impl Player {
             }
             for (t, _) in &due {
                 releases.remove(t);
+            }
+
+            // Press notes whose start time has arrived.
+            while ei < events.len() && (events[ei].0.round() as u64) <= elapsed {
+                let target = &events[ei].1;
+                self.press(target, dry_run)?;
+                ei += 1;
             }
 
             if dry_run {
@@ -405,8 +469,11 @@ impl Player {
 
     fn press(&mut self, target: &Target, dry_run: bool) -> Result<()> {
         let id = target.id();
-        let slot = self.held.entry(id).or_insert_with(|| (target.clone(), 0));
+        let slot = self.held.entry(id.clone()).or_insert_with(|| (target.clone(), 0));
         slot.1 += 1;
+        if slot.1 > 1 {
+            self.dropped += 1;
+        }
         if slot.1 == 1 {
             if dry_run {
                 self.log(&format!("[PRESS] {}", target.describe_on()));
@@ -450,5 +517,139 @@ impl Player {
         // No Shift bookkeeping is needed any more: every event carries its own
         // modifier flag, so no global modifier state can be left behind.
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{Config, PlayerConfig};
+    use crate::humanizer::Humanizer;
+    use crate::key_mapper::KeyMapper;
+    use crate::midi_parser::{Note, Song};
+    use std::sync::{Arc, Mutex};
+
+    /// Play a note list in dry-run and return the log lines.
+    fn play_notes(notes: Vec<Note>, humanize: u8) -> Vec<String> {
+        let cfg = Config::load(None).expect("builtin config");
+        let mapper = KeyMapper::from_config(&cfg.keyboard);
+        let humanizer = Humanizer::new(humanize, 1.0, cfg.humanize.clone());
+        let log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let mut player = Player::new(
+            mapper,
+            humanizer,
+            PlayerConfig::default(),
+            true,
+            OutputMode::Keys,
+            None,
+            Some(log.clone()),
+            None,
+        )
+        .expect("dry-run player");
+
+        let song = Song {
+            notes,
+            length_ms: 10_000.0,
+            ..Default::default()
+        };
+        player.play(&song, 1, true).expect("play");
+        let out = log.lock().unwrap().clone();
+        out
+    }
+
+    fn note(pitch: u8, start_ms: f64, duration_ms: f64) -> Note {
+        Note {
+            note: pitch,
+            channel: 0,
+            start_ms,
+            duration_ms,
+            velocity: 100,
+        }
+    }
+
+    fn presses(lines: &[String]) -> usize {
+        lines.iter().filter(|l| l.starts_with("[PRESS]")).count()
+    }
+
+    #[test]
+    fn legato_repeats_are_all_pressed() {
+        // The same key released exactly when the next note starts. Releasing
+        // after pressing used to swallow every repeat.
+        let notes = vec![
+            note(60, 0.0, 500.0),
+            note(60, 500.0, 500.0),
+            note(60, 1000.0, 500.0),
+        ];
+        assert_eq!(presses(&play_notes(notes, 0)), 3);
+    }
+
+    #[test]
+    fn duplicate_note_ons_on_the_same_tick_are_one_press() {
+        // Three note-ons for one key at one instant is a single physical press;
+        // it must not stick the key and swallow everything after it.
+        let notes = vec![
+            note(60, 0.0, 500.0),
+            note(60, 500.0, 500.0),
+            note(60, 500.0, 500.0),
+            note(60, 500.0, 500.0),
+            note(60, 1000.0, 500.0),
+        ];
+        let log = play_notes(notes, 0);
+        // 3 distinct presses: t=0, t=500 (triple collapsed), t=1000.
+        assert_eq!(presses(&log), 3);
+        assert!(!log.iter().any(|l| l.contains("could not be retriggered")));
+    }
+
+    #[test]
+    fn a_note_outlasting_the_next_one_is_trimmed_not_dropped() {
+        // 0..2000 overlaps the note at 1000. The first must be cut at 1000 so
+        // the second can sound.
+        let notes = vec![note(60, 0.0, 2000.0), note(60, 1000.0, 500.0)];
+        let log = play_notes(notes, 0);
+        assert_eq!(presses(&log), 2);
+    }
+
+    #[test]
+    fn humanize_zero_plays_durations_as_written() {
+        // A quiet note used to be shortened by up to 40% even at level 0.
+        let notes = vec![Note {
+            velocity: 1,
+            ..note(60, 0.0, 1000.0)
+        }];
+        let cfg = Config::load(None).expect("builtin config");
+        let humanizer = Humanizer::new(0, 1.0, cfg.humanize.clone());
+        let mut ns = notes;
+        humanizer.apply(&mut ns);
+        assert!((ns[0].duration_ms - 1000.0).abs() < 1e-9);
+        assert!((ns[0].start_ms - 0.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn velocity_never_lengthens_a_note() {
+        // Lengthening pushed loud notes past the next one on the same key,
+        // which dropped that next note.
+        let cfg = Config::load(None).expect("builtin config");
+        let humanizer = Humanizer::new(100, 1.0, cfg.humanize.clone());
+        let mut ns = vec![
+            Note {
+                velocity: 0,
+                ..note(60, 0.0, 1000.0)
+            },
+            Note {
+                velocity: 127,
+                ..note(62, 0.0, 1000.0)
+            },
+        ];
+        humanizer.apply(&mut ns);
+        for n in &ns {
+            assert!(
+                n.duration_ms <= 1000.0 + 1e-9,
+                "velocity {} lengthened the note to {}",
+                n.velocity,
+                n.duration_ms
+            );
+        }
+        // ...but it still shortens the quiet one.
+        assert!(ns[0].duration_ms < 1000.0);
     }
 }

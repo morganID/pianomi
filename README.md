@@ -270,14 +270,33 @@ The parser handles the cases that make naive implementations sound wrong:
 
 ## 🤖 Humanization
 
-Every effect scales with `--humanize` (0 = perfectly robotic, 100 = full
+Every effect scales with `--humanize` (0 = exactly as written, 100 = full
 variation defined in the config):
 
 - `timing_variation_ms` — random ±offset on each note start.
 - `duration_variation_ms` — random ±offset on each note length.
-- `use_velocity_for_duration` — louder MIDI notes are held a bit longer.
+- `use_velocity_for_duration` — softer notes are held a little less. This only
+  ever *shortens*: a note that outlasts the next one on the same key could not
+  be retriggered, so the next note would be lost.
 - `chord_delay_ms` — simultaneous notes are staggered so chords don't all
   strike on the same tick.
+
+### No note is ever dropped
+
+A key can only sound one note at a time, and files routinely violate that
+assumption — a sustain-pedal artefact, a note exported with an overlong
+duration, or the same pitch note-on'd three times on one tick. All of those
+used to make the *next* note on that key silently disappear.
+
+The player now normalises the schedule per key before it runs:
+
+- note-ons for the same key on the same millisecond collapse into one press;
+- a note that would still be held when the next one starts is trimmed at that
+  start, so the key is free for the retrigger.
+
+If anything still cannot be retriggered, playback ends with a
+`warning: N note(s) could not be retriggered` line instead of failing quietly.
+`--dry-run` reports the same thing, so you can check a file before playing it.
 
 ## ⚠️ Important notes
 

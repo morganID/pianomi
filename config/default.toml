@@ -338,9 +338,14 @@ keyboard.transpose = 0
 # Humanization
 # ---------------------------------------------------------------------------
 [humanize]
+# All of these are scaled by the --humanize level, so 0 plays the file exactly
+# as written.
 timing_variation_ms = 35
 duration_variation_ms = 25
 chord_delay_ms = 18
+# Softer notes are held slightly less (a velocity of 127 keeps the written
+# length). This never *lengthens* a note: one that outlasts the next note on
+# the same key cannot be retriggered, so that next note would be lost.
 use_velocity_for_duration = true
 
 # ---------------------------------------------------------------------------

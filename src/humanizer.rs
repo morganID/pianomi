@@ -56,9 +56,15 @@ impl Humanizer {
         let dvar = self.cfg.duration_variation_ms * self.level;
         let mut rng = rand::thread_rng();
         for n in notes.iter_mut() {
-            if self.cfg.use_velocity_for_duration {
-                // velocity 0..127 -> factor 0.6..1.1
-                let factor = 0.6 + (n.velocity as f64 / 127.0) * 0.5;
+            if self.cfg.use_velocity_for_duration && self.level > 0.0 {
+                // Softer notes are held a little less; a velocity of 127 keeps
+                // the written length. This deliberately never *extends* a note:
+                // a note that outlasts the next one on the same key cannot be
+                // retriggered, so the later note would be dropped entirely.
+                // Scaled by `level` too, so `--humanize 0` plays the file as
+                // written instead of warping every duration by up to 40%.
+                let soft = 1.0 - (n.velocity as f64 / 127.0);
+                let factor = 1.0 - 0.4 * soft * self.level;
                 n.duration_ms *= factor;
             }
             if dvar > 0.0 {
