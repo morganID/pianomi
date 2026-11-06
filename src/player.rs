@@ -362,6 +362,11 @@ pub struct Player {
     /// Release/press pairs on one physical key with no real key-up window.
     /// Reported at the end of a run instead of silently losing the note.
     tight_retriggers: usize,
+    /// Notes whose key-down was posted while the *same physical key* was still
+    /// down under a different label (`j` held, arpeggio hits `J` or `Ctrl+J`).
+    /// The OS sees no up→down transition, so the game cannot fire `InputBegan`
+    /// for it: the attack is inaudible even though the event was delivered.
+    physical_conflicts: usize,
     /// Which output path this player drives.
     mode: OutputMode,
     /// Key events are delivered into Roblox's event queue (`CGEventPostToPid`)
@@ -391,17 +396,25 @@ pub struct Player {
 ///
 /// Set `PlayerConfig::targeted_extra_gap_ms = 0` to turn the widening off for
 /// an A/B comparison against the stock margins.
-const TARGETED_RETRIGGER_GAP_MS: f64 = 50.0;
+///
+/// This particular constant is the gap between two *different* pitches that
+/// want one physical key on the same tick. Serialising them costs a full
+/// key-up window plus the hold floor, which is three 60 Hz frames — the
+/// queue-drain budget the jitter measurements kept pointing at.
 const TARGETED_SAME_KEY_GAP_MS: f64 = 60.0;
 
 /// Resolve the timing config the scheduler should use.
 ///
 /// Only targeted keyboard delivery changes anything: add
-/// `targeted_extra_gap_ms` to the key-up window, with floors that cover a
-/// couple of 60 Hz frames of queue-drain latency. `build_schedule` already
+/// `targeted_extra_gap_ms` to the key-up window. `build_schedule` already
 /// raises the multiplex gap to `min_hold_ms + retrigger_gap_ms`, so two
 /// pitches sharing one physical key inherit the wider window automatically.
 /// Note onsets are never touched by any of this.
+///
+/// The margin is **linear**, with no floor: `--targeted-extra-gap-ms 10` really
+/// does mean 20 + 10 = 30 ms. The default 20 + 30 = 50 ms is the smallest value
+/// the jitter measurements showed never collapsing below three 60 Hz frames, but
+/// clamping smaller requests up to it would make in-game A/B testing impossible.
 ///
 /// This is a free function as well as [`Player::effective_config`] so the CLI
 /// can print the same numbers the scheduler is about to use.
@@ -412,8 +425,7 @@ pub fn schedule_config_for(
 ) -> PlayerConfig {
     let mut cfg = config.clone();
     if targeted && mode == OutputMode::Keys && cfg.targeted_extra_gap_ms > 0.0 {
-        cfg.retrigger_gap_ms =
-            (cfg.retrigger_gap_ms + cfg.targeted_extra_gap_ms).max(TARGETED_RETRIGGER_GAP_MS);
+        cfg.retrigger_gap_ms += cfg.targeted_extra_gap_ms;
         cfg.same_key_gap_ms = cfg.same_key_gap_ms.max(TARGETED_SAME_KEY_GAP_MS);
     }
     cfg
@@ -460,6 +472,7 @@ impl Player {
             physical_drops: 0,
             multiplexed: 0,
             tight_retriggers: 0,
+            physical_conflicts: 0,
             targeted: false,
             presses: 0,
             releases: 0,
@@ -547,13 +560,14 @@ impl Player {
     fn finish_trace(&self) {
         crate::trace::end(&[
             format!(
-                "summary: presses={} releases={} dropped={} physical_drops={} multiplexed={} tight_retriggers={}",
+                "summary: presses={} releases={} dropped={} physical_drops={} multiplexed={} tight_retriggers={} physical_conflicts={}",
                 self.presses,
                 self.releases,
                 self.dropped,
                 self.physical_drops,
                 self.multiplexed,
-                self.tight_retriggers
+                self.tight_retriggers,
+                self.physical_conflicts
             ),
             "counters describe the whole play() call, all loops included".to_string(),
         ]);
@@ -573,6 +587,7 @@ impl Player {
         self.physical_drops = 0;
         self.multiplexed = 0;
         self.tight_retriggers = 0;
+        self.physical_conflicts = 0;
         self.presses = 0;
         self.releases = 0;
         let mut base = song.clone();
@@ -690,6 +705,15 @@ impl Player {
                  between the two onsets to keep min_hold_ms({:.0}). Lower \
                  min_hold_ms or retrigger_gap_ms if these notes are missing in game.",
                 self.tight_retriggers, effective.retrigger_gap_ms, effective.min_hold_ms
+            ));
+        }
+        if self.physical_conflicts > 0 {
+            self.log(&format!(
+                "warning: {} note(s) started while the same physical key was still \
+                 down under another label (e.g. a held j and an arpeggio hitting J). \
+                 The key-down is posted but the game sees no up→down transition, so \
+                 those attacks are inaudible.",
+                self.physical_conflicts
             ));
         }
         if self.physical_drops > 0 {
@@ -965,6 +989,16 @@ impl Player {
 
     fn press(&mut self, target: &Target, dry_run: bool, at_ms: f64, elapsed: u64) -> Result<()> {
         let id = target.id();
+        // A *different* label can occupy the same physical key (`j` held while
+        // an arpeggio hits `J`, or `Ctrl+J`). The OS sees no up→down transition
+        // on that keycode, so the game cannot fire `InputBegan` for this note
+        // even though the event itself is delivered. Counted separately from
+        // the same-label case below, because only the scheduler can prevent it.
+        let phys = target.physical_id();
+        let phys_busy = self
+            .held
+            .iter()
+            .any(|(other, (held_target, _))| other != &id && held_target.physical_id() == phys);
         let count = {
             let slot = self
                 .held
@@ -979,6 +1013,10 @@ impl Player {
         }
         if count == 1 {
             self.presses += 1;
+            if phys_busy {
+                self.physical_conflicts += 1;
+                self.trace_key(at_ms, elapsed, "PHYSICAL_HELD", target, Some(0));
+            }
             self.trace_key(at_ms, elapsed, "PRESS", target, Some(1));
             if dry_run {
                 self.log(&format!("[PRESS] {}", target.describe_on()));
@@ -1402,6 +1440,20 @@ mod tests {
         let plain = build_schedule(&notes, &pc, OutputMode::Keys, &mapper);
         assert_eq!(direct.events[0].2, plain.events[0].2);
         assert_eq!(direct.events[1].0, plain.events[1].0);
+    }
+
+    /// The flag is a plain additive margin, not a floor: asking for 10 ms must
+    /// yield 30 ms (20 + 10). Clamping small values up to 50 ms would make the
+    /// middle ground untestable in game.
+    #[test]
+    fn targeted_margin_is_linear_not_floored() {
+        let pc = PlayerConfig {
+            targeted_extra_gap_ms: 10.0,
+            ..Default::default()
+        };
+        let mut p = targeted_player(pc, OutputMode::Keys);
+        p.set_targeted(true);
+        assert_eq!(p.effective_config().retrigger_gap_ms, 30.0);
     }
 
     #[test]

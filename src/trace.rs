@@ -104,7 +104,7 @@ pub fn begin(header: &[String]) -> std::io::Result<PathBuf> {
     )?;
     writeln!(
         file,
-        "# kinds: PRESS, RELEASE, SUPPRESSED, HELD_RELEASE, DEFERRED"
+        "# kinds: PRESS, RELEASE, SUPPRESSED, HELD_RELEASE, DEFERRED, PHYSICAL_HELD"
     )?;
     file.flush()?;
     *lock() = Some(file);

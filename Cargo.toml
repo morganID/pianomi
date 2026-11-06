@@ -1,6 +1,6 @@
 [package]
 name = "pianomi"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2021"
 description = "Play MIDI files into Roblox piano games — keyboard replay or real MIDI output, with humanization (CLI + macOS menu bar app)"
 license = "MIT"

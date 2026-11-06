@@ -203,12 +203,12 @@ So Direct mode automatically widens the gap that the game can actually see:
 
 | Margin | HID (default) | Direct to Roblox |
 | --- | --- | --- |
-| key-up before the next press on one physical key | 20 ms | **50 ms** (20 + 30, floor 50) |
+| key-up before the next press on one physical key | 20 ms | **50 ms** (20 + 30, linear) |
 | two pitches sharing one key on the same tick | 30 ms, raised to `min_hold_ms + retrigger_gap_ms` (= 50 ms) | 60 ms floor, raised to `min_hold_ms + retrigger_gap_ms` (**= 80 ms** with defaults) |
 
-`targeted_extra_gap_ms` (default 30) controls the widening; set it to `0` with
-`--targeted-extra-gap-ms 0` or in the config for a clean A/B against the stock
-margins. As always, **only releases move** — every note onset stays exactly as
+`targeted_extra_gap_ms` (default 30) controls the widening and is **linear**:
+`--targeted-extra-gap-ms 10` gives 30 ms, `0` gives the stock 20 ms for a clean
+A/B. As always, **only releases move** — every note onset stays exactly as
 written, and no note is shortened below `min_hold_ms`. MIDI output is unaffected.
 `--dry-run` posts nothing, but it *does* preview the Direct-mode schedule when
 `--target-roblox`/`--target-pid` is also given, which is the cheapest way to
@@ -237,6 +237,25 @@ swallowed outright. A 20 ms key-up — fine on the synchronous HID path — is
 marginal here, which is exactly why the same song can play cleanly system-wide
 and lose notes in Direct mode. 50 ms is the smallest value that stayed above
 three 60 Hz frames in every sample.
+
+Widening further is **not** free, though, because the extra key-up has to fit
+inside the gap between two existing onsets. Sweeping the flag over the same
+dense file (`【Animenz】吉卜力组曲.mid`, 5977 notes) makes the trade-off visible:
+
+| `--targeted-extra-gap-ms` | Effective key-up | Pairs that no longer fit |
+| --- | --- | --- |
+| 0 | 20 ms | 2 |
+| 10 | 30 ms | 8 |
+| 20 | 40 ms | 28 |
+| **30** (default) | **50 ms** | **31** |
+| 50 | 70 ms | 80 |
+
+Those counts are pairs where the next onset arrives before the key-up window
+can be honoured — the run prints them as a `warning:`. So the margin buys
+queue safety at the cost of truncating more short holds, and the default 30 ms
+sits right before the knee of the curve: one more 20 ms step roughly triples
+the damage. Lower `min_hold_ms` if a particular file starts sounding clipped
+rather than skipped.
 
 If notes are still skipped in Direct mode, the fastest isolation is
 `--target-roblox --targeted-extra-gap-ms 0` vs `--target-roblox`: if only the
@@ -531,9 +550,12 @@ What the columns are for:
 - **drift** (`actual - scheduled`): a positive spike means the playback thread
   stalled. A steady drift was the old `pgrep`-on-the-hot-path bug.
 - **kind**: `PRESS` / `RELEASE` are posted events; `SUPPRESSED` is a note-on that
-  could not fire because the key was already held; `HELD_RELEASE` is a key-up
-  withheld because another note still owns the key; `DEFERRED` is a key-up that
-  arrived before its own key-down and was retried.
+  could not fire because the *same label* was already held; `PHYSICAL_HELD` is a
+  note-on whose **physical** key was still down under a different label (`j`
+  held while an arpeggio hits `J` or `Ctrl+J`) — the event is delivered but the
+  game sees no up→down transition, so the attack is inaudible; `HELD_RELEASE` is
+  a key-up withheld because another note still owns the key; `DEFERRED` is a
+  key-up that arrived before its own key-down and was retried.
 - **physical**: the stripped key. Filter on it to audit the key-up gaps:
 
 ```bash
@@ -544,7 +566,13 @@ grep '^E' ~/Library/Logs/Pianomi/trace.log |
 
 Anything below ~17 ms is invisible to a 60 Hz `IsKeyDown` poll; in Direct mode
 aim for 50 ms. The run ends with a `# summary:` line carrying the same counters
-the UI reports.
+the UI reports — `presses`, `releases`, `dropped`, `physical_drops`,
+`multiplexed`, `tight_retriggers`, and `physical_conflicts`. The last one is the
+only counter that measures *inaudible* notes: a `PHYSICAL_HELD` key-down is
+delivered but the game never sees the up→down edge, so it stays silent even
+though the event arrived. Non-zero means the song asks for two different
+pitches on one physical key with no room between them, and nothing on the
+playback side can fix it.
 
 `--target-pid PID` points playback at any process, which is how the jitter table
 above was measured: run a tiny AppKit event receiver, post to its PID, and
