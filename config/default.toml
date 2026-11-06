@@ -354,6 +354,39 @@ use_velocity_for_duration = true
 [player]
 start_delay_ms = 3000
 min_hold_ms = 30
+# Keyboard mode only: shorten notes that are longer than this (0 = keep the
+# written length). The START of every note is never touched; only its release
+# is pulled in. Useful when long holds block the next note on a shared physical
+# key (a sharp is the same key as the white note below it) or when too many keys
+# are held at once for the game to register new key-downs.
+# Try 300-500 for dense arrangements; 0 keeps full legato. MIDI output ignores
+# this and always sends the exact written duration.
+max_hold_ms = 0
+# Two different pitches can need the SAME physical key on one tick (C2 = "1",
+# C#2 = "!"). One key-down cannot fire InputBegan twice, so instead of dropping
+# one note Pianomi plays them in quick succession: press/release the first, then
+# press the second this many ms later. 30 ms is below the ear's "flam" threshold
+# (sounds like a chord) but long enough for the game to register both key-downs.
+# Raised to min_hold_ms + retrigger_gap_ms if set lower. 0 = disable (the
+# second note is dropped).
+same_key_gap_ms = 30
+# Keyboard mode only: how far (ms) BEFORE the next note's start the previous
+# note on the SAME physical key must be released. Roblox samples IsKeyDown once
+# per frame; a key-up and the next key-down posted in the same millisecond look
+# like an unbroken hold, so the second note never fires InputBegan. 20 ms is
+# just over one 60 Hz frame. Only releases move — every onset stays exactly as
+# written, and no note is ever shortened below min_hold_ms. 0 restores the old
+# back-to-back behaviour. MIDI output ignores this.
+retrigger_gap_ms = 20
+# Direct to Roblox (--target-roblox / Output ▸ Direct to Roblox) only: extra
+# key-up margin on top of retrigger_gap_ms. CGEventPostToPid puts events into
+# Roblox's run-loop queue, which drains them in frame-sized batches rather than
+# applying each one synchronously like the HID tap does. A key-up and the next
+# key-down that are less than one drain apart are both invisible to the game's
+# once-per-frame IsKeyDown poll, so the second note is skipped. 30 ms widens
+# the key-up to 50 ms (three 60 Hz frames); only releases move, onsets do not.
+# 0 disables the widening for an A/B comparison. MIDI output ignores this.
+targeted_extra_gap_ms = 30
 tick_ms = 1
 loop_gap_ms = 800
 

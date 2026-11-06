@@ -6,6 +6,7 @@
 //!   * `pianomi-gui` — the macOS menu bar app.
 
 pub mod config;
+pub mod focus;
 pub mod humanizer;
 pub mod key_mapper;
 pub mod keycode;
@@ -14,6 +15,7 @@ pub mod midi_parser;
 pub mod os2midi;
 pub mod perm;
 pub mod player;
+pub mod trace;
 
 pub use config::Config;
 pub use midi_parser::{Note, Song};

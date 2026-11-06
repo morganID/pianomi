@@ -222,7 +222,8 @@ fn main() {
             with_nothing += 1;
         }
     }
-    println!("\nmodifier (FlagsChanged) events seen: {flag_events}");    println!("key-downs with a real Shift held:    {with_real_shift}   <- IsKeyDown sees these");
+    println!("\nmodifier (FlagsChanged) events seen: {flag_events}");
+    println!("key-downs with a real Shift held:    {with_real_shift}   <- IsKeyDown sees these");
     println!("key-downs with the Shift flag only:  {with_flag_only}");
     println!("key-downs with no Shift at all:      {with_nothing}");
     println!("key-downs with a real Ctrl held:     {with_real_ctrl}   <- IsKeyDown sees these");

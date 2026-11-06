@@ -64,6 +64,34 @@ pub struct PlayerConfig {
     pub start_delay_ms: u64,
     #[serde(default = "default_f64_30")]
     pub min_hold_ms: f64,
+    /// Keyboard mode only: cap how long a key stays down, in ms. `0` keeps the
+    /// written duration. Onsets are never moved — only the release is pulled in.
+    #[serde(default = "default_f64_0")]
+    pub max_hold_ms: f64,
+    /// Keyboard mode only: when two DIFFERENT pitches need the same physical
+    /// key on the same tick (e.g. C2 `1` + C#2 `!`), play them in sequence
+    /// separated by this many ms instead of dropping one. `0` disables it.
+    /// Values below `min_hold_ms` are raised to it so both presses register.
+    #[serde(default = "default_f64_30")]
+    pub same_key_gap_ms: f64,
+    /// Keyboard mode only: real-time gap (ms) between a key-up and the next
+    /// key-down on the SAME physical key. A sharp is the same physical key as
+    /// the white note below it (`1` / `!`); releasing exactly when the next
+    /// note starts puts both CGEvent posts in one scheduler pass, and the game
+    /// — which samples `IsKeyDown` once per frame — only sees "still down" and
+    /// never fires `InputBegan` for the second note. Pulling the release back
+    /// by this much leaves a real frame boundary. **Onsets are never moved;**
+    /// only the earlier note's duration shrinks.
+    #[serde(default = "default_f64_20")]
+    pub retrigger_gap_ms: f64,
+    /// Keyboard mode only, and only when key events are posted straight into
+    /// Roblox's event queue (`--target-roblox` / Direct to Roblox). Those events
+    /// are drained in frame-sized batches, so a key-up and the next key-down
+    /// need a wider real-time separation than they do on the synchronous HID
+    /// path. This many ms is added on top of `retrigger_gap_ms`; `0` disables
+    /// the widening for an A/B comparison. Only releases move — onsets do not.
+    #[serde(default = "default_f64_30")]
+    pub targeted_extra_gap_ms: f64,
     #[serde(default = "default_u64_1")]
     pub tick_ms: u64,
     #[serde(default = "default_u64_800")]
@@ -104,6 +132,12 @@ fn default_u64_3000() -> u64 {
 fn default_f64_30() -> f64 {
     30.0
 }
+fn default_f64_20() -> f64 {
+    20.0
+}
+fn default_f64_0() -> f64 {
+    0.0
+}
 fn default_u64_1() -> u64 {
     1
 }
@@ -132,6 +166,10 @@ impl Default for PlayerConfig {
         PlayerConfig {
             start_delay_ms: default_u64_3000(),
             min_hold_ms: default_f64_30(),
+            max_hold_ms: default_f64_0(),
+            same_key_gap_ms: default_f64_30(),
+            retrigger_gap_ms: default_f64_20(),
+            targeted_extra_gap_ms: default_f64_30(),
             tick_ms: default_u64_1(),
             loop_gap_ms: default_u64_800(),
             shift_mode: default_shift_mode(),

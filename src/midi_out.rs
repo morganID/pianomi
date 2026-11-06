@@ -66,6 +66,16 @@ impl MidiOut {
         self.send(&note_off_msg(channel, note))
     }
 
+    /// Control change (e.g. sustain pedal CC64, channel volume CC7, pan CC10).
+    ///
+    /// Forwarding these is what makes a performance sound like the original
+    /// instead of a dry, pedal-less run of notes. `used_channels` is updated so
+    /// the panic button still silences exactly the channels we touched.
+    pub fn control_change(&mut self, channel: u8, controller: u8, value: u8) -> Result<()> {
+        self.used_channels |= 1 << (channel & 0x0F);
+        self.send(&[0xB0 | (channel & 0x0F), controller & 0x7F, value & 0x7F])
+    }
+
     /// Panic button: silence every channel we have used. Sent on stop and at
     /// the end of playback so a receiver can never be left with a stuck note if
     /// we were killed mid-chord.

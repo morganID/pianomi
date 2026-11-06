@@ -23,6 +23,23 @@ pub struct Note {
     pub velocity: u8,
 }
 
+/// One MIDI `ControlChange` (CC) message, resolved to wall-clock time.
+///
+/// Pianomi used to discard every CC (the parser's `_ => {}` arm swallowed
+/// them), so sustain pedal, channel volume and pan — the events a real
+/// performance leans on for its sound — never reached the output. These are
+/// captured now and forwarded in MIDI mode so a synth/DAW gets the whole take.
+#[derive(Debug, Clone)]
+pub struct ControlEvent {
+    pub channel: u8,
+    /// Controller number, e.g. 64 = sustain pedal, 7 = channel volume, 10 = pan.
+    pub controller: u8,
+    /// Controller value, 0..=127.
+    pub value: u8,
+    /// Wall-clock position of the message, resolved through the tempo map.
+    pub at_ms: f64,
+}
+
 /// One `FF 51` tempo change.
 #[derive(Debug, Clone, Copy)]
 pub struct TempoEvent {
@@ -126,6 +143,9 @@ impl TrackInfo {
 #[derive(Debug, Clone, Default)]
 pub struct Song {
     pub notes: Vec<Note>,
+    /// Every ControlChange (sustain, volume, pan, …) in the file, resolved to
+    /// wall-clock time and sorted by position.
+    pub control_events: Vec<ControlEvent>,
     pub ticks_per_beat: u16,
     /// Total length of the song in milliseconds (last note end).
     pub length_ms: f64,
@@ -259,6 +279,8 @@ pub fn parse_midi(path: &Path) -> Result<Song> {
     let mut declared_tempo: Vec<(u64, u32)> = Vec::new();
     let mut time_sigs: Vec<TimeSigEvent> = Vec::new();
     let mut key_sigs: Vec<KeySigEvent> = Vec::new();
+    // (track, tick, channel, controller, value) for every ControlChange.
+    let mut controls: Vec<(u32, u64, u8, u8, u8)> = Vec::new();
     let mut tracks: Vec<TrackInfo> = Vec::with_capacity(smf.tracks.len());
     // (track, channel, note) -> queue of (start_tick, velocity).
     //
@@ -277,12 +299,7 @@ pub fn parse_midi(path: &Path) -> Result<Song> {
     let mut raw: Vec<RawNote> = Vec::new();
 
     /// Close one open note for `key` at `tick`, recording it if one was open.
-    fn close_note(
-        open: &mut OpenNotes,
-        key: (u32, u8, u8),
-        tick: u64,
-        raw: &mut Vec<RawNote>,
-    ) {
+    fn close_note(open: &mut OpenNotes, key: (u32, u8, u8), tick: u64, raw: &mut Vec<RawNote>) {
         if let Some(queue) = open.get_mut(&key) {
             if let Some((start, vel)) = queue.pop_front() {
                 if queue.is_empty() {
@@ -376,6 +393,18 @@ pub fn parse_midi(path: &Path) -> Result<Song> {
                             if !info.programs.contains(&p) {
                                 info.programs.push(p);
                             }
+                        }
+                        // ControlChange (sustain pedal, channel volume, pan, …):
+                        // captured so the output can reproduce the performance's
+                        // dynamics instead of dropping them on the floor.
+                        MidiMessage::Controller { controller, value } => {
+                            controls.push((
+                                ti as u32,
+                                abs,
+                                ch,
+                                controller.as_int(),
+                                value.as_int(),
+                            ));
                         }
                         _ => {}
                     }
@@ -486,6 +515,23 @@ pub fn parse_midi(path: &Path) -> Result<Song> {
             .unwrap_or(std::cmp::Ordering::Equal)
     });
 
+    // Resolve every ControlChange to wall-clock time and sort by position so the
+    // player can replay them in order.
+    let mut control_events: Vec<ControlEvent> = controls
+        .iter()
+        .map(|&(_, tick, ch, cc, val)| ControlEvent {
+            channel: ch,
+            controller: cc,
+            value: val,
+            at_ms: tick_to_micros(tick, &tempo_map, base) / 1000.0,
+        })
+        .collect();
+    control_events.sort_by(|a, b| {
+        a.at_ms
+            .partial_cmp(&b.at_ms)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
     let length_ms = notes
         .iter()
         .map(|n| n.start_ms + n.duration_ms)
@@ -502,6 +548,7 @@ pub fn parse_midi(path: &Path) -> Result<Song> {
 
     Ok(Song {
         notes,
+        control_events,
         ticks_per_beat,
         length_ms,
         tracks,

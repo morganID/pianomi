@@ -40,6 +40,42 @@ impl Binding {
             self.label.clone()
         }
     }
+
+    /// The **physical** key this binding lands on, with all modifiers stripped.
+    ///
+    /// The Virtual Piano layout reuses the same 36 QWERTY keys three times:
+    /// plain (`1` = C2), Shift (`!` = C#2) and Ctrl (`Ctrl+1` = A0). Those are
+    /// three different notes but *one* physical key, and a key that is already
+    /// down cannot produce a second key-down — so a `!` arriving while `1` is
+    /// held simply never sounds. The scheduler must therefore group and trim
+    /// by this id, not by [`Binding::id`].
+    ///
+    /// Shifted digit symbols are folded back to their base digit, and uppercase
+    /// letters to lowercase, matching [`crate::keycode::resolve_key`].
+    pub fn physical_id(&self) -> String {
+        let label = self.label.trim();
+        // Spelled-out keys ("Space", "Enter", …) are not single characters, so
+        // they cannot collide with a letter binding by accident.
+        if label.chars().count() > 1 {
+            return format!("name:{}", label.to_ascii_lowercase());
+        }
+        let c = label.chars().next().unwrap_or('?');
+        let base = match c {
+            '!' => '1',
+            '@' => '2',
+            '#' => '3',
+            '$' => '4',
+            '%' => '5',
+            '^' => '6',
+            '&' => '7',
+            '*' => '8',
+            '(' => '9',
+            ')' => '0',
+            c if c.is_ascii_uppercase() => c.to_ascii_lowercase(),
+            c => c,
+        };
+        base.to_string()
+    }
 }
 
 pub struct KeyMapper {
@@ -92,5 +128,45 @@ impl KeyMapper {
             max = max.max(n);
         }
         (min, max)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn modifier_variants_share_one_physical_key() {
+        assert_eq!(Binding::new("1", false).physical_id(), "1");
+        assert_eq!(Binding::new("!", false).physical_id(), "1");
+        assert_eq!(Binding::new("1", true).physical_id(), "1");
+        assert_eq!(Binding::new("s", false).physical_id(), "s");
+        assert_eq!(Binding::new("S", false).physical_id(), "s");
+        assert_eq!(Binding::new("y", true).physical_id(), "y");
+    }
+
+    #[test]
+    fn different_physical_keys_stay_distinct() {
+        assert_ne!(
+            Binding::new("1", false).physical_id(),
+            Binding::new("2", false).physical_id()
+        );
+        assert_ne!(
+            Binding::new("s", false).physical_id(),
+            Binding::new("d", false).physical_id()
+        );
+        // Spelled-out labels must not be mistaken for their first letter.
+        assert_ne!(
+            Binding::new("Space", false).physical_id(),
+            Binding::new("s", false).physical_id()
+        );
+    }
+
+    #[test]
+    fn logical_ids_still_keep_modifiers_apart() {
+        // Refcounting needs the finer-grained identity; only scheduling folds
+        // the three variants together.
+        assert_ne!(Binding::new("1", false).id(), Binding::new("!", false).id());
+        assert_ne!(Binding::new("1", false).id(), Binding::new("1", true).id());
     }
 }

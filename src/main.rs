@@ -30,8 +30,9 @@ enum Commands {
         #[arg(short, long)]
         file: PathBuf,
 
-        /// Humanize level 0-100 (0 = robotic, 100 = max variation).
-        #[arg(long, default_value_t = 50)]
+        /// Humanize level 0-100 (0 = exactly as written, 100 = max variation).
+        /// Defaults to 0 so the file plays faithfully unless you opt in.
+        #[arg(long, default_value_t = 0)]
         humanize: u8,
 
         /// Playback speed multiplier (e.g. 2.0 = twice as fast).
@@ -58,6 +59,57 @@ enum Commands {
         /// Roblox's IsKeyDown) or "char" (Shift flag + typed character only).
         #[arg(long, value_name = "MODE")]
         shift_mode: Option<String>,
+
+        /// Keyboard only: shorten notes longer than N ms. Note START times are
+        /// never changed, only the release. 0 (default) keeps written lengths.
+        /// Useful for dense songs where long holds block later notes.
+        #[arg(long, value_name = "MS")]
+        max_hold_ms: Option<f64>,
+
+        /// Keyboard only: gap in ms between two different pitches that need the
+        /// same physical key on one tick (e.g. C2 "1" + C#2 "!"). 0 disables it
+        /// and drops the second note. Default 30 (raised to min_hold_ms).
+        #[arg(long, value_name = "MS")]
+        same_key_gap_ms: Option<f64>,
+
+        /// Keyboard only: real-time gap (ms) between a key-up and the next
+        /// key-down on the SAME physical key. Roblox samples IsKeyDown once per
+        /// frame; releasing exactly at the next note's start makes the game see
+        /// one unbroken hold and lose the second note. Default 20 (just over one
+        /// 60 Hz frame). Onsets never move — only the earlier release. 0 = old
+        /// back-to-back behaviour.
+        #[arg(long, value_name = "MS")]
+        retrigger_gap_ms: Option<f64>,
+
+        /// Keyboard only, Direct to Roblox: extra key-up margin (ms) added to
+        /// --retrigger-gap-ms because CGEventPostToPid events are drained in
+        /// frame-sized batches. Default 30 (so the key-up becomes 50 ms).
+        /// Onsets never move. 0 disables the widening for an A/B comparison.
+        #[arg(long, value_name = "MS")]
+        targeted_extra_gap_ms: Option<f64>,
+
+        /// macOS: send key events only to the running Roblox.app process
+        /// (CGEventPostToPid) instead of the whole system. No focus stealing,
+        /// no keystrokes leaking into other apps. Still keyboard events.
+        #[arg(long)]
+        target_roblox: bool,
+
+        /// Debug: post key events to an arbitrary PID instead of the system-wide
+        /// HID tap. Point this at a local event receiver to measure delivery
+        /// timing without sending anything into Roblox. macOS only.
+        #[arg(long, value_name = "PID", conflicts_with = "target_roblox")]
+        target_pid: Option<i32>,
+
+        /// Debug: write a per-event playback trace (scheduled vs actual time,
+        /// key-up gaps, delivery target, warnings) that survives a hang.
+        /// Also enabled by PIANOMI_TRACE=1.
+        #[arg(long)]
+        trace: bool,
+
+        /// Debug: trace file destination. Defaults to
+        /// ~/Library/Logs/Pianomi/trace.log (or PIANOMI_TRACE_LOG).
+        #[arg(long, value_name = "PATH")]
+        trace_log: Option<PathBuf>,
 
         /// Don't press any keys — just print the scheduled events.
         #[arg(long)]
@@ -102,6 +154,7 @@ enum Commands {
 }
 
 fn main() -> Result<()> {
+    pianomi::trace::init_from_env();
     let cli = Cli::parse();
     match cli.command {
         Commands::Play {
@@ -113,10 +166,35 @@ fn main() -> Result<()> {
             transpose,
             loops,
             shift_mode,
+            max_hold_ms,
+            same_key_gap_ms,
+            retrigger_gap_ms,
+            targeted_extra_gap_ms,
+            target_roblox,
+            target_pid,
+            trace,
+            trace_log,
             dry_run,
             midi_out,
         } => cmd_play(
-            file, humanize, speed, config, channel, transpose, loops, shift_mode, dry_run, midi_out,
+            file,
+            humanize,
+            speed,
+            config,
+            channel,
+            transpose,
+            loops,
+            shift_mode,
+            max_hold_ms,
+            same_key_gap_ms,
+            retrigger_gap_ms,
+            targeted_extra_gap_ms,
+            target_roblox,
+            target_pid,
+            trace,
+            trace_log,
+            dry_run,
+            midi_out,
         ),
         Commands::ListMappings { config } => cmd_list(config),
         Commands::Info {
@@ -130,6 +208,25 @@ fn main() -> Result<()> {
         }
         Commands::MidiPorts => cmd_midi_ports(),
     }
+}
+
+/// PID of the running RobloxPlayer, used by `--target-roblox`.
+fn roblox_pid() -> Result<i32> {
+    let out = std::process::Command::new("pgrep")
+        .arg("-x")
+        .arg("RobloxPlayer")
+        .output()
+        .map_err(|e| anyhow::anyhow!("running pgrep: {e}"))?;
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| l.trim().parse::<i32>().ok())
+        .next()
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "RobloxPlayer is not running. Launch /Applications/Roblox.app first, \
+                 or drop --target-roblox to use system-wide key events."
+            )
+        })
 }
 
 fn cmd_midi_ports() -> Result<()> {
@@ -160,9 +257,30 @@ fn cmd_play(
     transpose: i8,
     loops: u32,
     shift_mode: Option<String>,
+    max_hold_ms: Option<f64>,
+    same_key_gap_ms: Option<f64>,
+    retrigger_gap_ms: Option<f64>,
+    targeted_extra_gap_ms: Option<f64>,
+    target_roblox: bool,
+    target_pid: Option<i32>,
+    trace: bool,
+    trace_log: Option<PathBuf>,
     dry_run: bool,
     midi_out: Option<String>,
 ) -> Result<()> {
+    // Debug plumbing is resolved before anything else so even a config/parse
+    // failure leaves a readable trace behind.
+    if trace {
+        pianomi::trace::set_enabled(true);
+    }
+    if let Some(path) = &trace_log {
+        std::env::set_var("PIANOMI_TRACE_LOG", path);
+        pianomi::trace::set_enabled(true);
+    }
+    if pianomi::trace::enabled() {
+        println!("Trace       : {}", pianomi::trace::log_path().display());
+    }
+
     let mut cfg = Config::load(config.as_deref())?;
     if transpose != 0 {
         cfg.keyboard.transpose = transpose;
@@ -175,11 +293,42 @@ fn cmd_play(
             pianomi::keycode::ShiftMode::Char => "char",
         };
         if !mode.trim().eq_ignore_ascii_case(canonical) {
-            anyhow::bail!(
-                "unknown --shift-mode {mode:?} (expected \"key\" or \"char\")"
-            );
+            anyhow::bail!("unknown --shift-mode {mode:?} (expected \"key\" or \"char\")");
         }
         cfg.player.shift_mode = canonical.to_string();
+    }
+    if let Some(ms) = max_hold_ms {
+        if !ms.is_finite() || ms < 0.0 {
+            anyhow::bail!("--max-hold-ms must be a non-negative number (0 disables the cap)");
+        }
+        cfg.player.max_hold_ms = ms;
+    }
+    if cfg.player.max_hold_ms > 0.0 && cfg.player.max_hold_ms < cfg.player.min_hold_ms {
+        anyhow::bail!(
+            "--max-hold-ms ({}) cannot be below min_hold_ms ({}) — notes would stop registering",
+            cfg.player.max_hold_ms,
+            cfg.player.min_hold_ms
+        );
+    }
+    if let Some(gap) = same_key_gap_ms {
+        if !gap.is_finite() || gap < 0.0 {
+            anyhow::bail!("--same-key-gap-ms must be non-negative (0 disables multiplexing)");
+        }
+        cfg.player.same_key_gap_ms = gap;
+    }
+    if let Some(gap) = retrigger_gap_ms {
+        if !gap.is_finite() || gap < 0.0 {
+            anyhow::bail!("--retrigger-gap-ms must be non-negative (0 disables the key-up gap)");
+        }
+        cfg.player.retrigger_gap_ms = gap;
+    }
+    if let Some(extra) = targeted_extra_gap_ms {
+        if !extra.is_finite() || extra < 0.0 {
+            anyhow::bail!(
+                "--targeted-extra-gap-ms must be non-negative (0 disables the Direct-mode widening)"
+            );
+        }
+        cfg.player.targeted_extra_gap_ms = extra;
     }
 
     let mode = if midi_out.is_some() {
@@ -187,6 +336,69 @@ fn cmd_play(
     } else {
         OutputMode::Keys
     };
+
+    if target_roblox {
+        if mode == OutputMode::Midi {
+            println!("note: --target-roblox has no effect in --midi-out mode");
+        } else if dry_run {
+            // Nothing is posted, so this is a pure schedule preview — and a
+            // Direct-mode schedule is exactly what needs previewing, because
+            // its key-up margins are wider than the HID defaults.
+            println!(
+                "note: --target-roblox in --dry-run previews the Direct-mode schedule \
+                 (no events are posted)"
+            );
+        } else {
+            #[cfg(target_os = "macos")]
+            {
+                let pid = roblox_pid()?;
+                pianomi::keycode::set_event_target_roblox(true);
+                println!(
+                    "Event target  : RobloxPlayer pid {} (targeted, PID auto-recovery on)",
+                    pid
+                );
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                anyhow::bail!("--target-roblox is only available on macOS");
+            }
+        }
+    }
+
+    // Debug transport: send to any process. Used to aim playback at a local
+    // event receiver and measure delivery without involving Roblox at all.
+    if let Some(pid) = target_pid {
+        if mode == OutputMode::Midi {
+            println!("note: --target-pid has no effect in --midi-out mode");
+        } else if dry_run {
+            println!(
+                "note: --target-pid in --dry-run previews the Direct-mode schedule \
+                 (no events are posted)"
+            );
+        } else {
+            #[cfg(target_os = "macos")]
+            {
+                pianomi::keycode::set_event_target_pid(pid);
+                println!("Event target  : pid {pid} (debug receiver, no PID tracking)");
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                anyhow::bail!("--target-pid is only available on macOS");
+            }
+        }
+    }
+
+    // The scheduler needs to know which transport the events travel over:
+    // a queued (PID-targeted) event needs a wider key-up window than one
+    // applied synchronously to the HID tap.
+    // Dry-run still counts as "targeted" for scheduling purposes: it posts
+    // nothing, so previewing the wider Direct-mode margins is free and is the
+    // only way to A/B the two schedules without touching the game.
+    #[cfg(target_os = "macos")]
+    let targeted = (target_roblox || target_pid.is_some()) && mode == OutputMode::Keys;
+    #[cfg(not(target_os = "macos"))]
+    let targeted = false;
+    let timing = pianomi::player::schedule_config_for(&cfg.player, mode, targeted);
 
     // Open the port before anything else so a bad name fails fast, but never in
     // dry-run: previewing must not publish or touch a device.
@@ -213,6 +425,38 @@ fn cmd_play(
             pianomi::keycode::ShiftMode::Char => "Shift flag + typed char only",
         };
         println!("Sharp keys   : {} — {}", cfg.player.shift_mode, what);
+        if cfg.player.max_hold_ms > 0.0 {
+            println!(
+                "Hold cap     : {:.0} ms (starts unchanged, releases pulled in)",
+                cfg.player.max_hold_ms
+            );
+        }
+        if mode == OutputMode::Keys {
+            // Print the *effective* values, not the raw config: Direct mode
+            // widens these margins inside the scheduler.
+            println!(
+                "Retrigger    : {:.0} ms of real key-up before the next press on one \
+                 physical key (onsets unchanged)",
+                timing.retrigger_gap_ms
+            );
+            if timing.same_key_gap_ms > 0.0 {
+                let g = timing
+                    .same_key_gap_ms
+                    .max(timing.min_hold_ms + timing.retrigger_gap_ms);
+                println!(
+                    "Shared keys  : 2 pitches / key played {:.0} ms apart (no note dropped)",
+                    g
+                );
+            } else {
+                println!("Shared keys  : multiplexing off (second pitch dropped)");
+            }
+        }
+        if targeted {
+            println!(
+                "Direct mode  : +{:.0} ms key-up margin for Roblox's queued events",
+                cfg.player.targeted_extra_gap_ms
+            );
+        }
     }
 
     let mut song = parse_midi(&file)?;
@@ -243,6 +487,9 @@ fn cmd_play(
         None,
         None,
     )?;
+    // Must match the transport chosen above: queued events need wider key-up
+    // margins than synchronous HID posts.
+    player.set_targeted(targeted);
     player.play(&song, loops, dry_run)?;
     println!("Done.");
     Ok(())
@@ -399,6 +646,26 @@ fn cmd_info(file: PathBuf, verbose: bool, config: Option<PathBuf>) -> Result<()>
         song.total_note_events()
     );
     println!("Channels used   : {}", ch_list(&song.channels_used));
+    if !song.control_events.is_empty() {
+        let sustain = song
+            .control_events
+            .iter()
+            .filter(|c| c.controller == 64)
+            .count();
+        println!(
+            "Control changes : {} (sustain cc64 x{}, channel-volume cc7 x{}, pan cc10 x{})",
+            song.control_events.len(),
+            sustain,
+            song.control_events
+                .iter()
+                .filter(|c| c.controller == 7)
+                .count(),
+            song.control_events
+                .iter()
+                .filter(|c| c.controller == 10)
+                .count(),
+        );
+    }
 
     // ---- tempo -------------------------------------------------------------
     println!(
@@ -535,4 +802,64 @@ fn cmd_info(file: PathBuf, verbose: bool, config: Option<PathBuf>) -> Result<()>
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The default must stay 0: a fresh playback has to reproduce the MIDI
+    /// file exactly, with humanization being an explicit opt-in.
+    #[test]
+    fn humanize_defaults_to_zero() {
+        let cli = Cli::try_parse_from(["pianomi", "play", "-f", "song.mid"]).unwrap();
+        match cli.command {
+            Commands::Play { humanize, .. } => assert_eq!(humanize, 0),
+            _ => panic!("expected the play subcommand"),
+        }
+    }
+
+    #[test]
+    fn humanize_can_still_be_opted_into() {
+        let cli =
+            Cli::try_parse_from(["pianomi", "play", "-f", "song.mid", "--humanize", "50"]).unwrap();
+        match cli.command {
+            Commands::Play { humanize, .. } => assert_eq!(humanize, 50),
+            _ => panic!("expected the play subcommand"),
+        }
+    }
+
+    #[test]
+    fn direct_mode_margin_is_opt_in_via_config() {
+        let cli = Cli::try_parse_from(["pianomi", "play", "-f", "song.mid"]).unwrap();
+        match cli.command {
+            Commands::Play {
+                targeted_extra_gap_ms,
+                ..
+            } => assert_eq!(targeted_extra_gap_ms, None),
+            _ => panic!("expected the play subcommand"),
+        }
+    }
+
+    /// `0` is the A/B switch that restores the stock key-up margins. Clap must
+    /// not swallow it as "no value".
+    #[test]
+    fn direct_mode_margin_zero_is_parseable() {
+        let cli = Cli::try_parse_from([
+            "pianomi",
+            "play",
+            "-f",
+            "song.mid",
+            "--targeted-extra-gap-ms",
+            "0",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Play {
+                targeted_extra_gap_ms,
+                ..
+            } => assert_eq!(targeted_extra_gap_ms, Some(0.0)),
+            _ => panic!("expected the play subcommand"),
+        }
+    }
 }

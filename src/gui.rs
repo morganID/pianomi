@@ -98,11 +98,24 @@ struct Ui {
     out: OutChoice,
     m_out_keys: CheckMenuItem,
     m_out_virt: CheckMenuItem,
+    /// Opt-in: post key events straight to the Roblox process instead of the
+    /// global HID tap. OFF by default — the system-wide path is the one that
+    /// has been verified in game and has no per-event PID lookup overhead.
+    direct_roblox: bool,
+    m_direct: CheckMenuItem,
     /// Live list of MIDI destinations, rebuilt by "Rescan".
     m_out_dests: Vec<(String, CheckMenuItem)>,
     /// Monotonic id counter for destination menu items.
     out_seq: usize,
     sub_out: Submenu,
+    /// Debug ▸ Log playback to file. Writes every scheduled key event plus all
+    /// warnings to `~/Library/Logs/Pianomi/trace.log`, because a bundle started
+    /// with `open` has stdout on /dev/null.
+    m_trace: CheckMenuItem,
+    /// Set by a menu action that legitimately wants to keep focus elsewhere
+    /// (Reveal Debug Log opens Finder). The event loop skips its focus restore
+    /// for that one action.
+    suppress_restore: bool,
 }
 
 impl Ui {
@@ -124,6 +137,10 @@ impl Ui {
     }
 
     fn pick_file(&mut self) {
+        // `rfd` runs a synchronous NSOpenPanel, which activates this process.
+        // Its FocusManager restores `NSApp.keyWindow`, but we have no windows,
+        // so focus would stay stolen. The event loop hands focus back to the
+        // previously frontmost app on the next tick (after NSMenu closes).
         if let Some(path) = rfd::FileDialog::new()
             .add_filter("MIDI files", &["mid", "midi"])
             .pick_file()
@@ -184,6 +201,39 @@ impl Ui {
         let spec = self.out.spec();
         stop.store(false, Ordering::SeqCst);
 
+        // Opt-in: scope keyboard events to the Roblox process. OFF by default
+        // because the system-wide HID path is the one verified in game; targeted
+        // posting queues events in Roblox's event loop and can shift timing.
+        // When Roblox is not running we fall back to the focused window rather
+        // than silently dropping the whole song.
+        //
+        // `targeted` is the *resolved* truth (Roblox actually found), because
+        // the scheduler must widen its key-up margins only when events really
+        // travel through CGEventPostToPid. Getting this wrong either loses notes
+        // in Direct mode or needlessly shortens notes on the HID path.
+        #[cfg(target_os = "macos")]
+        let targeted = {
+            use pianomi::keycode;
+            let direct = self.direct_roblox && mode == OutputMode::Keys && !dry;
+            if direct {
+                keycode::set_event_target_roblox(true);
+                if keycode::event_target_pid() <= 0 {
+                    keycode::set_event_target_roblox(false);
+                    keycode::set_event_target_pid(0);
+                    self.set_status("Roblox not running — keys go to focused window");
+                    false
+                } else {
+                    true
+                }
+            } else {
+                keycode::set_event_target_roblox(false);
+                keycode::set_event_target_pid(0);
+                false
+            }
+        };
+        #[cfg(not(target_os = "macos"))]
+        let targeted = false;
+
         thread::spawn(move || {
             // The MIDI port is opened inside the worker: CoreMIDI connections
             // are not Send, so the handle must never leave the thread that made
@@ -203,6 +253,7 @@ impl Ui {
                     None,
                     Some(stop),
                 )?;
+                p.set_targeted(targeted);
                 p.play(&song, loops, dry)
             })();
             let mut s = shared.lock().unwrap();
@@ -237,8 +288,13 @@ impl Ui {
                 // id that a previously removed item already had.
                 self.out_seq += 1;
                 let checked = matches!(&self.out, OutChoice::Destination(n) if *n == name);
-                let it =
-                    CheckMenuItem::with_id(format!("od{}", self.out_seq), &name, true, checked, None);
+                let it = CheckMenuItem::with_id(
+                    format!("od{}", self.out_seq),
+                    &name,
+                    true,
+                    checked,
+                    None,
+                );
                 let _ = self.sub_out.append(&it);
                 self.m_out_dests.push((name, it));
             }
@@ -292,6 +348,48 @@ impl Ui {
                 ));
             }
             "outrescan" => self.rescan_midi(),
+            "dbgtrace" => {
+                let on = self.m_trace.is_checked();
+                pianomi::trace::set_enabled(on);
+                self.set_status(if on {
+                    "Debug logging ON — written on the next playback"
+                } else {
+                    "Debug logging off"
+                });
+            }
+            "dbgreveal" => {
+                let path = pianomi::trace::log_path();
+                if let Some(dir) = path.parent() {
+                    let _ = std::fs::create_dir_all(dir);
+                }
+                // `open -R` needs the file to exist, and creating it here also
+                // gives the user an empty log to inspect before playing.
+                let _ = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&path);
+                match std::process::Command::new("open")
+                    .arg("-R")
+                    .arg(&path)
+                    .spawn()
+                {
+                    Ok(_) => {
+                        // Finder is *supposed* to come forward here; skip the
+                        // focus hand-back for this one action.
+                        self.suppress_restore = true;
+                        self.set_status(&format!("Revealed {}", path.display()));
+                    }
+                    Err(e) => self.set_status(&format!("Could not reveal log: {e}")),
+                }
+            }
+            "outdirect" => {
+                self.direct_roblox = self.m_direct.is_checked();
+                self.set_status(if self.direct_roblox {
+                    "Keys go straight to Roblox (focus independent)"
+                } else {
+                    "Keys go to the focused window"
+                });
+            }
             _ => {
                 // A MIDI destination picked from the rescan list. Looked up by
                 // the item's own id, so a rescan can renumber freely.
@@ -442,6 +540,10 @@ fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    // Debug logging is opt-in via PIANOMI_TRACE=1 (or the Debug menu once the
+    // app is running). The menu starts checked if the env var asked for it.
+    pianomi::trace::init_from_env();
+
     // A one-line banner so it is obvious which build is running: the crash fix
     // changed how key events are dispatched, and an old binary looks identical
     // from the outside. If this line is missing, you are on a stale build.
@@ -473,7 +575,7 @@ fn main() -> anyhow::Result<()> {
     let sub_h = Submenu::with_id("sub_h", "Humanize", true);
     let mut m_humanize = Vec::new();
     for v in [0u8, 25, 50, 75, 100] {
-        let it = CheckMenuItem::with_id(format!("h{}", v), format!("{}%", v), true, v == 50, None);
+        let it = CheckMenuItem::with_id(format!("h{}", v), format!("{}%", v), true, v == 0, None);
         sub_h.append(&it)?;
         m_humanize.push((v, it));
     }
@@ -536,7 +638,16 @@ fn main() -> anyhow::Result<()> {
         false,
         None,
     );
+    let m_direct = CheckMenuItem::with_id(
+        "outdirect",
+        "Direct to Roblox (no focus needed)",
+        true,
+        false,
+        None,
+    );
     sub_out.append(&m_out_keys)?;
+    sub_out.append(&m_direct)?;
+    sub_out.append(&PredefinedMenuItem::separator())?;
     sub_out.append(&m_out_virt)?;
     sub_out.append(&PredefinedMenuItem::separator())?;
 
@@ -547,8 +658,7 @@ fn main() -> anyhow::Result<()> {
         Ok(names) if !names.is_empty() => {
             for name in names {
                 out_seq += 1;
-                let it =
-                    CheckMenuItem::with_id(format!("od{}", out_seq), &name, true, false, None);
+                let it = CheckMenuItem::with_id(format!("od{}", out_seq), &name, true, false, None);
                 sub_out.append(&it)?;
                 m_out_dests.push((name, it));
             }
@@ -573,6 +683,19 @@ fn main() -> anyhow::Result<()> {
         None,
     ))?;
 
+    // Debug lives in its own submenu so the everyday menu stays short.
+    let sub_dbg = Submenu::with_id("sub_dbg", "Debug", true);
+    let m_trace = CheckMenuItem::with_id(
+        "dbgtrace",
+        "Log playback to file",
+        true,
+        pianomi::trace::enabled(),
+        None,
+    );
+    let m_reveal = MenuItem::with_id("dbgreveal", "Reveal Debug Log", true, None);
+    sub_dbg.append(&m_trace)?;
+    sub_dbg.append(&m_reveal)?;
+
     let menu = Menu::new();
     menu.append_items(&[
         &title,
@@ -591,16 +714,14 @@ fn main() -> anyhow::Result<()> {
         &sub_l,
         &sub_sh,
         &sub_out,
+        &sub_dbg,
         &PredefinedMenuItem::separator(),
         &PredefinedMenuItem::quit(Some("Quit Pianomi")),
     ])?;
 
     let mut tray_builder = TrayIconBuilder::new()
         .with_menu(Box::new(menu))
-        .with_tooltip(concat!(
-            "Pianomi v",
-            env!("CARGO_PKG_VERSION")
-        ))
+        .with_tooltip(concat!("Pianomi v", env!("CARGO_PKG_VERSION")))
         .with_icon(make_icon());
     // Render as a macOS template image so it adapts to the menu bar theme.
     #[cfg(target_os = "macos")]
@@ -613,7 +734,10 @@ fn main() -> anyhow::Result<()> {
         cfg,
         song: None,
         file_name: String::new(),
-        humanize: 50,
+        // 0 = play the file exactly as written. Humanization is opt-in: the
+        // default must not silently alter timing/velocity before the user has
+        // even heard the song once.
+        humanize: 0,
         speed: 1.0,
         transpose: 0,
         loops: 1,
@@ -637,9 +761,13 @@ fn main() -> anyhow::Result<()> {
         out: OutChoice::Keys,
         m_out_keys,
         m_out_virt,
+        direct_roblox: false,
+        m_direct,
         m_out_dests,
         out_seq,
         sub_out,
+        m_trace,
+        suppress_restore: false,
     };
 
     // Optional: `pianomi-gui <file.mid>` preloads a song.
@@ -654,16 +782,58 @@ fn main() -> anyhow::Result<()> {
     {
         use tao::platform::macos::{ActivationPolicy, EventLoopExtMacOS};
         event_loop.set_activation_policy(ActivationPolicy::Accessory);
+        // tao calls `activateIgnoringOtherApps:YES` in
+        // applicationDidFinishLaunching by default. For a menu bar utility that
+        // means it rips focus away from Roblox the moment it starts. Turning it
+        // off is the primary fix for "the GUI steals focus".
+        event_loop.set_activate_ignoring_other_apps(false);
     }
+
+    // Remember who owned the frontmost slot before our UI appeared. A status
+    // item click and rfd's NSOpenPanel can still activate us, so after every
+    // menu action we hand focus back on the NEXT tick — AppKit ignores
+    // activation requests while NSMenu is still tracking and would close the
+    // menu if we did it immediately.
+    let self_pid = std::process::id() as i32;
+    let mut last_external_pid = {
+        let p = pianomi::focus::frontmost_pid();
+        if p > 0 && p != self_pid {
+            p
+        } else {
+            0
+        }
+    };
+    // Also covers the launch activation itself, on the very first tick.
+    let mut restore_pending = true;
 
     event_loop.run(move |_event, _elwt, control_flow| {
         // Poll periodically so menu clicks (delivered via muda's channel) and
         // playback-thread status updates are picked up promptly.
         *control_flow = ControlFlow::WaitUntil(Instant::now() + Duration::from_millis(150));
+
+        let front = pianomi::focus::frontmost_pid();
+        if front > 0 && front != self_pid {
+            last_external_pid = front;
+        }
+        if restore_pending {
+            restore_pending = false;
+            if front == self_pid && last_external_pid > 0 {
+                pianomi::focus::activate_pid(last_external_pid);
+            }
+        }
+
+        let mut handled = false;
         while let Ok(ev) = MenuEvent::receiver().try_recv() {
             ui.on_menu(ev.id.0.as_str());
+            handled = true;
         }
         while let Ok(_ev) = TrayIconEvent::receiver().try_recv() {}
         ui.refresh();
+        // An action that deliberately hands focus somewhere else (Reveal Debug
+        // Log) must not be undone by the generic restore on the next tick.
+        let suppress = std::mem::take(&mut ui.suppress_restore);
+        if handled && !suppress {
+            restore_pending = true;
+        }
     });
 }

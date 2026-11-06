@@ -1987,16 +1987,19 @@ checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 
 [[package]]
 name = "pianomi"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "clap",
  "core-foundation",
  "core-graphics 0.25.0",
  "enigo",
+ "foreign-types",
+ "libc",
  "midir",
  "midly",
  "muda",
+ "objc",
  "rand 0.8.8",
  "rfd",
  "serde",

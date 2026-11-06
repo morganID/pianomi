@@ -365,11 +365,206 @@ pub fn parse_shift_mode(s: &str) -> ShiftMode {
     }
 }
 
+/// Scope synthetic key events to one process instead of the whole HID system.
+///
+/// `pid <= 0` restores the default system-wide posting. Only meaningful on
+/// macOS, where the events are created by [`post_key`]; other platforms go
+/// through `enigo` and have no per-process equivalent.
+#[cfg(target_os = "macos")]
+pub fn set_event_target_pid(pid: i32) {
+    mac_post::set_target_pid(pid);
+}
+
+/// Track the running Roblox process by name, re-resolving its PID if the app
+/// restarts mid-song. Prefer this over [`set_event_target_pid`] for Roblox.
+#[cfg(target_os = "macos")]
+pub fn set_event_target_roblox(enabled: bool) {
+    mac_post::set_target_roblox(enabled);
+}
+
+/// The process currently receiving targeted events, or `0` for system-wide.
+#[cfg(target_os = "macos")]
+pub fn event_target_pid() -> i32 {
+    mac_post::target_pid()
+}
+
 #[cfg(target_os = "macos")]
 mod mac_post {
     use core_graphics::event::{CGEvent, CGEventFlags, CGEventTapLocation};
     use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
+    use foreign_types::ForeignType;
     use std::cell::RefCell;
+    use std::ffi::c_void;
+    use std::process::Command;
+    use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
+    use std::sync::OnceLock;
+    use std::time::Duration;
+
+    /// When non-zero, events go straight to this process instead of the global
+    /// HID tap. `0` keeps the historical system-wide behaviour.
+    static TARGET_PID: AtomicI32 = AtomicI32::new(0);
+    /// Re-resolve the Roblox PID while playing. Roblox can quit and relaunch
+    /// (e.g. a teleport or a tray restart), which changes its PID; a PID cached
+    /// once at startup would then silently swallow every later key event.
+    static TRACK_ROBLOX: AtomicBool = AtomicBool::new(false);
+    /// Guards spawning the single PID watcher thread.
+    static WATCHER_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+    /// Last timestamp handed to `CGEventPostToPid`. Used to force strict
+    /// monotonicity even when two events are created inside one mach tick.
+    static LAST_STAMP_NS: AtomicU64 = AtomicU64::new(0);
+
+    // `core-graphics` 0.25 exposes neither of these, but both are public
+    // CoreGraphics API and are needed to repair targeted event delivery.
+    // `libc`'s mach bindings are deprecated in favour of the `mach2` crate;
+    // declaring the two C entry points locally keeps this build warning-free
+    // and avoids pulling in a whole crate for two libSystem functions.
+    #[repr(C)]
+    struct MachTimebase {
+        numer: u32,
+        denom: u32,
+    }
+
+    #[link(name = "CoreGraphics", kind = "framework")]
+    extern "C" {
+        fn CGEventSetTimestamp(event: *const c_void, timestamp: u64);
+    }
+
+    // Only the regression tests need to read a timestamp back.
+    #[cfg(test)]
+    #[link(name = "CoreGraphics", kind = "framework")]
+    extern "C" {
+        fn CGEventGetTimestamp(event: *const c_void) -> u64;
+    }
+
+    extern "C" {
+        fn mach_absolute_time() -> u64;
+        fn mach_timebase_info(info: *mut MachTimebase) -> i32;
+    }
+
+    /// `CGEventTimestamp` is documented as "roughly, nanoseconds since
+    /// startup". `mach_absolute_time()` is in platform-dependent ticks, so it
+    /// has to be scaled by the mach timebase (125/3 on this Apple Silicon
+    /// machine, 1/1 on Intel). Writing raw mach ticks would put the event
+    /// ~40x in the past on ARM.
+    fn timebase() -> (u64, u64) {
+        static TB: OnceLock<(u64, u64)> = OnceLock::new();
+        *TB.get_or_init(|| {
+            let mut info = MachTimebase { numer: 0, denom: 0 };
+            // SAFETY: valid pointer to a POD out-parameter.
+            unsafe { mach_timebase_info(&mut info) };
+            if info.numer == 0 || info.denom == 0 {
+                (1, 1)
+            } else {
+                (u64::from(info.numer), u64::from(info.denom))
+            }
+        })
+    }
+
+    fn now_ns() -> u64 {
+        let (numer, denom) = timebase();
+        // SAFETY: libSystem function with no arguments.
+        unsafe { mach_absolute_time() }
+            .saturating_mul(numer)
+            .saturating_div(denom)
+    }
+
+    /// A fresh, strictly increasing, current timestamp.
+    ///
+    /// Two events posted in the same mach tick must not share a timestamp:
+    /// a run loop is free to coalesce same-timestamp events, which would
+    /// swallow a key-down/key-up pair (or a sharp's Shift bracket).
+    fn next_timestamp_ns() -> u64 {
+        let now = now_ns();
+        let mut prev = LAST_STAMP_NS.load(Ordering::Relaxed);
+        loop {
+            let next = now.max(prev.saturating_add(1));
+            match LAST_STAMP_NS.compare_exchange_weak(
+                prev,
+                next,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return next,
+                Err(actual) => prev = actual,
+            }
+        }
+    }
+
+    /// Give a synthetic event a real timestamp.
+    ///
+    /// `CGEventCreateKeyboardEvent` (and every other `CGEventCreate*` on this
+    /// OS) leaves the timestamp at **0** — verified for `Private`,
+    /// `CombinedSessionState` and `HIDSystemState` sources. `CGEventPost(HID)`
+    /// gets away with it because the WindowServer stamps the event as it
+    /// enters the HID stream. `CGEventPostToPid` does not: it hands the event
+    /// straight to the target process's Mach event queue, timestamp 0 and
+    /// all. The receiving run loop then sees thousands of events dated "boot
+    /// time" — they get coalesced, held, or reordered, which is exactly the
+    /// "some notes are delayed" symptom in Direct to Roblox mode.
+    fn stamp(ev: &CGEvent) {
+        let ts = next_timestamp_ns();
+        // SAFETY: `ev` is a live CGEventRef; CoreGraphics does not retain it.
+        unsafe { CGEventSetTimestamp(ev.as_ptr() as *const c_void, ts) };
+    }
+
+    pub fn set_target_pid(pid: i32) {
+        TARGET_PID.store(pid, Ordering::Relaxed);
+        TRACK_ROBLOX.store(false, Ordering::Relaxed);
+    }
+
+    pub fn set_target_roblox(enabled: bool) {
+        TRACK_ROBLOX.store(enabled, Ordering::Relaxed);
+        if !enabled {
+            TARGET_PID.store(0, Ordering::Relaxed);
+            return;
+        }
+        TARGET_PID.store(resolve_roblox_pid().unwrap_or(0), Ordering::Relaxed);
+
+        // NEVER resolve the PID on the event-posting thread. A `pgrep` spawn
+        // costs ~25 ms (measured up to 62 ms); doing it every 500 ms between
+        // key events stalls playback and is audible as a tempo hiccup. A
+        // detached watcher keeps the atomic fresh instead. `kill(pid, 0)` is a
+        // cheap syscall, so `pgrep` only runs when Roblox actually died.
+        if !WATCHER_ACTIVE.swap(true, Ordering::SeqCst) {
+            std::thread::spawn(|| loop {
+                std::thread::sleep(Duration::from_millis(500));
+                if !TRACK_ROBLOX.load(Ordering::Relaxed) {
+                    continue;
+                }
+                let pid = TARGET_PID.load(Ordering::Relaxed);
+                if pid > 0 && pid_alive(pid) {
+                    continue;
+                }
+                if let Some(found) = resolve_roblox_pid() {
+                    TARGET_PID.store(found, Ordering::Relaxed);
+                }
+            });
+        }
+    }
+
+    /// Liveness probe without spawning a process.
+    pub(super) fn pid_alive(pid: i32) -> bool {
+        // `kill(pid, 0)` performs no signal delivery; it only checks that the
+        // process exists and we are allowed to signal it.
+        unsafe { libc::kill(pid, 0) == 0 }
+    }
+
+    pub fn target_pid() -> i32 {
+        TARGET_PID.load(Ordering::Relaxed)
+    }
+
+    fn resolve_roblox_pid() -> Option<i32> {
+        let out = Command::new("pgrep")
+            .arg("-x")
+            .arg("RobloxPlayer")
+            .output()
+            .ok()?;
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|l| l.trim().parse::<i32>().ok())
+            .next()
+    }
 
     thread_local! {
         /// One event source per thread: creating it is a syscall and playback
@@ -389,6 +584,39 @@ mod mac_post {
             slot.clone()
                 .ok_or_else(|| anyhow::anyhow!("CGEventSource unavailable"))
         })
+    }
+
+    /// Deliver one event either to the whole HID system (default) or directly
+    /// to a single process's event queue.
+    ///
+    /// `CGEventPostToPid` does not steal focus and does not leak keystrokes
+    /// into other applications, which is what scoping playback to
+    /// `/Applications/Roblox.app` means. It still delivers an ordinary keyboard
+    /// event — the receiving game's input model is unchanged.
+    ///
+    /// Only the targeted branch stamps the event. The system-wide HID branch
+    /// is left byte-for-byte as it was: the WindowServer already stamps events
+    /// entering the HID stream, and that path is the one verified to be
+    /// timing-accurate in the game.
+    ///
+    /// This is the hot path (thousands of calls per song), so it must stay
+    /// allocation-free and must never spawn a process or take a blocking lock.
+    /// The PID is refreshed by the watcher thread started in
+    /// `set_target_roblox`; `stamp` is two atomics plus one CoreGraphics call
+    /// (measured at ~0.00004 ms).
+    fn deliver(ev: &CGEvent) {
+        let tracking = TRACK_ROBLOX.load(Ordering::Relaxed);
+        let pid = TARGET_PID.load(Ordering::Relaxed);
+        if pid > 0 {
+            stamp(ev);
+            ev.post_to_pid(pid);
+        } else if tracking {
+            // Roblox is gone. Dropping the event is deliberate: falling back to
+            // the global HID tap would spray keystrokes into whatever app the
+            // user happens to be using.
+        } else {
+            ev.post(CGEventTapLocation::HID);
+        }
     }
 
     pub fn post(
@@ -418,7 +646,7 @@ mod mac_post {
             }
         }
 
-        ev.post(CGEventTapLocation::HID);
+        deliver(&ev);
         Ok(())
     }
 
@@ -433,8 +661,76 @@ mod mac_post {
         let ev = CGEvent::new_keyboard_event(source()?, vk, down)
             .map_err(|_| anyhow::anyhow!("could not create a CGEvent"))?;
         ev.set_flags(if down { flag } else { CGEventFlags::empty() });
-        ev.post(CGEventTapLocation::HID);
+        deliver(&ev);
         Ok(())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn raw(ev: &CGEvent) -> *const c_void {
+            ev.as_ptr() as *const c_void
+        }
+
+        /// Documents the CoreGraphics behaviour this fix works around. If a
+        /// future macOS starts stamping synthetic events itself, the fix is
+        /// still correct (we overwrite with a fresh current stamp), but the
+        /// test should be updated so the assumption stays visible.
+        #[test]
+        fn synthetic_keyboard_events_are_born_with_a_zero_timestamp() {
+            let ev = CGEvent::new_keyboard_event(source().unwrap(), 0x7F, false).unwrap();
+            let ts = unsafe { CGEventGetTimestamp(raw(&ev)) };
+            assert_eq!(ts, 0);
+        }
+
+        #[test]
+        fn stamps_are_current_and_strictly_increasing() {
+            let ev = CGEvent::new_keyboard_event(source().unwrap(), 0x7F, false).unwrap();
+            let ptr = raw(&ev);
+            let mut prev = 0u64;
+            for _ in 0..2000 {
+                stamp(&ev);
+                let ts = unsafe { CGEventGetTimestamp(ptr) };
+                assert!(
+                    ts > prev,
+                    "timestamps must strictly increase: {ts} <= {prev}"
+                );
+                // The clock must be real nanoseconds-since-boot, not raw mach
+                // ticks (which would be ~41x too small on Apple Silicon).
+                let lag = now_ns().saturating_sub(ts);
+                assert!(lag < 50_000_000, "stamp {ts} is more than 50 ms stale");
+                prev = ts;
+            }
+        }
+
+        #[test]
+        fn timestamp_scaling_matches_mach_timebase() {
+            let (numer, denom) = timebase();
+            let mach = unsafe { mach_absolute_time() };
+            let expected = mach.saturating_mul(numer).saturating_div(denom);
+            let actual = now_ns();
+            let drift = actual.saturating_sub(expected);
+            assert!(drift < 50_000_000, "clock conversion is off by {drift} ns");
+        }
+
+        /// The important wiring test: a `post()` that takes the
+        /// `CGEventPostToPid` branch must go through `stamp()`. A key-up of an
+        /// unassigned keycode is a no-op for every application, including the
+        /// test runner itself.
+        #[test]
+        fn targeted_delivery_stamps_before_posting() {
+            static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+            let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+            let saved = TARGET_PID.swap(std::process::id() as i32, Ordering::Relaxed);
+            let before = LAST_STAMP_NS.load(Ordering::Relaxed);
+            post(0x7F, false, false, false, None).unwrap();
+            let after = LAST_STAMP_NS.load(Ordering::Relaxed);
+            TARGET_PID.store(saved, Ordering::Relaxed);
+
+            assert!(after > before, "targeted delivery must stamp the event");
+        }
     }
 }
 
@@ -465,5 +761,14 @@ mod tests {
     fn builtin_config_uses_key_mode() {
         let cfg = crate::config::Config::load(None).expect("builtin config");
         assert_eq!(parse_shift_mode(&cfg.player.shift_mode), ShiftMode::Key);
+    }
+
+    /// The PID watcher must be able to tell live from dead without spawning a
+    /// process — that spawn was the source of the periodic tempo stall.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn pid_liveness_probe_needs_no_process_spawn() {
+        assert!(mac_post::pid_alive(std::process::id() as i32));
+        assert!(!mac_post::pid_alive(i32::MAX));
     }
 }

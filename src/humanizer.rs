@@ -32,6 +32,13 @@ impl Humanizer {
         }
     }
 
+    /// The configured humanize level as a percentage (0-100). Used by the
+    /// playback trace header: humanize > 0 deliberately perturbs timing, so a
+    /// trace without this number is easy to misread.
+    pub fn level_pct(&self) -> u8 {
+        (self.level * 100.0).round() as u8
+    }
+
     /// Mutates `notes` in place, applying speed scaling and humanization.
     pub fn apply(&self, notes: &mut [Note]) {
         // 1. Speed scaling — everything is relative to the original timeline.

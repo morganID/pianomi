@@ -1,6 +1,6 @@
 [package]
 name = "pianomi"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 description = "Play MIDI files into Roblox piano games — keyboard replay or real MIDI output, with humanization (CLI + macOS menu bar app)"
 license = "MIT"
@@ -52,6 +52,18 @@ midir = "0.10"
 # macOS: post key events with per-event modifier flags, so a sharp never needs
 # the real Shift key to be pressed (see src/keycode.rs).
 [target.'cfg(target_os = "macos")'.dependencies]
-core-graphics = "0.25"
+# `elcapitan` exposes CGEvent::post_to_pid, used by --target-roblox to scope
+# key events to the Roblox process instead of the global HID tap.
+core-graphics = { version = "0.25", features = ["elcapitan"] }
+# `CGEvent` is a foreign_type; the ForeignType trait supplies as_ptr(), which
+# we need for the CGEventSetTimestamp shim (the crate has no timestamp API).
+foreign-types = "0.5"
 # Used by examples/probe_keys.rs to pump a run loop while an event tap listens.
 core-foundation = "0.10"
+# AppKit focus helpers (NSWorkspace / NSRunningApplication) for the menu bar
+# app. Already in the dependency tree via tao; declared directly so src/focus.rs
+# can use the Objective-C runtime without pulling in a second bridge.
+objc = "0.2"
+# Cheap `kill(pid, 0)` liveness probe for the Roblox PID watcher (avoids
+# spawning `pgrep` on the playback thread).
+libc = "0.2"

@@ -55,11 +55,27 @@ any running copy and installs to `/Applications`. The bundle is signed with a
 real code-signing identity when one is available, so the Accessibility grant
 survives rebuilds (an ad-hoc signature would reset it on every build).
 
+The menu bar app never takes focus away from the game: tao's launch-time
+activation is disabled, and after a menu click or the Open MIDI dialog focus is
+handed back to the app that was frontmost before. Keyboard playback keeps the
+verified system-wide HID path by default. **Output ▸ Direct to Roblox (no focus
+needed)** is an optional toggle: it posts straight to the Roblox process
+(`CGEventPostToPid`), so notes land even when another app is active and never
+leak into a text field. Targeted events are now stamped with real, strictly
+increasing timestamps (see below), which fixes the coalescing/delay they used
+to cause; it is still off by default because Roblox's run loop has to drain
+those events, making the HID path the more predictable timing reference.
+Humanize starts at **0%** (exact playback); pick a level under **Humanize** to
+opt in.
+
 
 ## 🎮 Usage
 
 ```bash
-# Play a song with medium humanization
+# Play a song exactly as written (humanize defaults to 0)
+pianomi play -f song.mid
+
+# Opt in to medium humanization
 pianomi play -f song.mid --humanize 50
 
 # Play twice as fast, only channel 1, 3 loops
@@ -106,15 +122,139 @@ pianomi play -f song.mid --config my-config.toml
 | Flag | Default | Meaning |
 | --- | --- | --- |
 | `-f/--file` | — | MIDI file path (required) |
-| `--humanize` | `50` | Humanize level 0-100 |
+| `--humanize` | `0` | Humanize level 0-100 (0 = exactly as written) |
 | `-s/--speed` | `1.0` | Speed multiplier |
 | `--config` | built-in | TOML config file |
 | `--channel` | all | Restrict to one MIDI channel (1-16) |
 | `--transpose` | `0` | Semitones to shift every note |
 | `--loops` | `1` | Repeat count |
 | `--shift-mode` | from config (`key`) | `key` = real Shift per note, `char` = Shift flag + typed character only |
-| `--dry-run` | off | Print the whole event schedule instead of pressing keys — instant, not real-time |
+| `--max-hold-ms [MS]` | `0` (off) | Keyboard only: shorten notes longer than N ms. **Starts never move**, only releases are pulled in. Try `300`–`500` for dense songs |
+| `--retrigger-gap-ms [MS]` | `20` | Keyboard only: real key-up time between a release and the next press on the **same physical key**. Prevents the game from seeing one unbroken hold when two notes share `1`/`!`/`Ctrl+1`. Onsets never move; `0` restores back-to-back releases |
+| `--same-key-gap-ms [MS]` | `30` | Gap between two *different pitches* that need one physical key on the same tick. Raised to `min_hold_ms + retrigger_gap_ms`; `0` drops the second |
+| `--target-roblox` | off | macOS: post key events **only to the running Roblox.app process** (`CGEventPostToPid`) instead of system-wide — no focus stealing, nothing leaks into other apps |
+| `--targeted-extra-gap-ms [MS]` | `30` | Direct mode only: extra key-up margin added to `--retrigger-gap-ms` because targeted events are drained in frame-sized batches (so 20 + 30 = 50 ms). Onsets never move; `0` disables the widening for an A/B comparison |
+| `--target-pid [PID]` | off | **Debug:** post events to any process instead of the HID tap, e.g. a local event receiver. macOS only; implies the Direct-mode margins |
+| `--trace` | off | **Debug:** write a per-event trace (scheduled vs actual time, gaps, delivery target, warnings) to `~/Library/Logs/Pianomi/trace.log`. Also `PIANOMI_TRACE=1` |
+| `--trace-log [PATH]` | `~/Library/Logs/Pianomi/trace.log` | **Debug:** trace destination (implies `--trace`) |
+| `--dry-run` | off | Print the whole event schedule instead of pressing keys — instant, not real-time. Combined with `--target-roblox` it previews the Direct-mode margins |
 | `--midi-out [NAME]` | off | Send MIDI instead of keystrokes; no value publishes a virtual port |
+
+## 🎯 Scoping playback to Roblox.app
+
+By default key events are posted to the **global HID tap**: the Roblox window
+must be focused, and a real Shift press is visible to every app on the Mac.
+
+`--target-roblox` switches delivery to `CGEventPostToPid()`. Pianomi looks up
+the running `RobloxPlayer` PID and posts every event straight into that
+process's event queue:
+
+```bash
+pianomi play -f song.mid --target-roblox
+```
+
+- No focus stealing, no keystrokes leaking into other apps.
+- The Roblox PID is re-resolved during playback (Roblox can quit and relaunch
+  on a teleport or tray restart). PID lookups run on a **detached watcher
+  thread**: `pgrep` costs ~25 ms (up to 62 ms measured), so doing it on the
+  playback thread produced an audible tempo hiccup. The watcher uses a
+  `kill(pid, 0)` liveness probe instead and only spawns `pgrep` when Roblox
+  actually died.
+- **Every targeted event is timestamped.** `CGEventCreateKeyboardEvent` leaves
+  synthetic events with a timestamp of **0** (verified for `Private`,
+  `CombinedSessionState` and `HIDSystemState` sources). `CGEventPost(HID)`
+  gets away with it because the WindowServer stamps events entering the HID
+  stream; `CGEventPostToPid` hands the event to the target's queue as-is. A
+  queue full of zero-timestamp events gets coalesced, held or reordered by the
+  receiving run loop — that was the "some notes are delayed" symptom. Pianomi
+  now stamps each targeted event with a fresh, strictly increasing
+  nanoseconds-since-boot clock (`CGEventSetTimestamp` + the mach timebase)
+  before posting. The system-wide HID branch is deliberately left untouched.
+- If Roblox disappears, events are dropped rather than falling back to the
+  global tap, so keys never spray into other apps.
+- Requires `/Applications/Roblox.app` to be running, and still needs
+  Accessibility permission for the launching binary.
+- It remains **off by default**. Targeted events still have to be drained by
+  Roblox's own run loop, so the system-wide HID path is the timing reference;
+  turn this on only when you specifically need to play while another app is
+  frontmost.
+- **It is still keyboard input.** This scoping changes *where* the event goes,
+  not *what* the game can receive. The Virtual Piano still has 36 physical keys
+  reused across plain / Shift / Ctrl layers, no note-off, no velocity and no
+  sustain. Note loss from shared physical keys is solved by the scheduler
+  (above), not by the transport.
+- Untested caveat: `UserInputService:IsKeyDown(LeftShift)` may read global
+  modifier state that a PID-targeted event does not update. If sharps come out
+  as naturals, try `--shift-mode char` or drop `--target-roblox`.
+
+### Direct mode: why some notes used to be skipped
+
+Targeted delivery was verified to be lossless at the OS level — an AppKit
+receiver got **100% of the posted events**, even while completely unfocused.
+The loss happens one layer up: `CGEventPost(HID)` changes the modifier/key state
+synchronously, whereas `CGEventPostToPid` hands events to Roblox's run loop,
+which **drains them in frame-sized batches**. The Virtual Piano polls
+`IsKeyDown` once per frame. If a key-up and the following key-down land in the
+same drain, the game never observes the key going up: it sees one unbroken hold
+and never fires `InputBegan` for the second note. That is the "ada nada yang
+di-skip" symptom — timing, not missing events.
+
+So Direct mode automatically widens the gap that the game can actually see:
+
+| Margin | HID (default) | Direct to Roblox |
+| --- | --- | --- |
+| key-up before the next press on one physical key | 20 ms | **50 ms** (20 + 30, floor 50) |
+| two pitches sharing one key on the same tick | 30 ms, raised to `min_hold_ms + retrigger_gap_ms` (= 50 ms) | 60 ms floor, raised to `min_hold_ms + retrigger_gap_ms` (**= 80 ms** with defaults) |
+
+`targeted_extra_gap_ms` (default 30) controls the widening; set it to `0` with
+`--targeted-extra-gap-ms 0` or in the config for a clean A/B against the stock
+margins. As always, **only releases move** — every note onset stays exactly as
+written, and no note is shortened below `min_hold_ms`. MIDI output is unaffected.
+`--dry-run` posts nothing, but it *does* preview the Direct-mode schedule when
+`--target-roblox`/`--target-pid` is also given, which is the cheapest way to
+inspect the wider margins. The CLI prints the effective numbers, and playback
+logs a `Direct mode : …` line with the margins actually used.
+
+#### Measured delivery jitter
+
+A local AppKit receiver was posted a `down → up → gap → down` pattern through
+`CGEventPostToPid` (12 repetitions per requested gap, 100 ms hold). Every event
+arrived (336/336), but the gap the receiver actually observed was not the gap
+that was posted:
+
+| Requested key-up gap | Observed min | Observed median | Observed max | Notes |
+| --- | --- | --- | --- | --- |
+| 0 ms | 0.13 ms | 0.15 ms | 0.22 ms | — |
+| 5 ms | 0.15 ms | 11.5 ms | 16.7 ms | **1 of 12 collapsed to ~0.1 ms** |
+| 10 ms | 10.7 ms | 12.5 ms | 17.7 ms | still inside one 60 Hz frame |
+| 20 ms | 15.1 ms | 23.8 ms | 30.6 ms | **can shrink below one frame** |
+| 30 ms | 29.5 ms | 33.7 ms | 35.7 ms | ~2 frames |
+| 50 ms | 50.3 ms | 53.0 ms | 58.6 ms | ~3 frames, never collapsed |
+| 80 ms | 78.0 ms | 84.0 ms | 87.4 ms | — |
+
+So the queued path adds a few ms of latency plus jitter, and small gaps can be
+swallowed outright. A 20 ms key-up — fine on the synchronous HID path — is
+marginal here, which is exactly why the same song can play cleanly system-wide
+and lose notes in Direct mode. 50 ms is the smallest value that stayed above
+three 60 Hz frames in every sample.
+
+If notes are still skipped in Direct mode, the fastest isolation is
+`--target-roblox --targeted-extra-gap-ms 0` vs `--target-roblox`: if only the
+latter is clean, the queue-drain theory is confirmed for that song. Very dense
+files may also need a smaller `min_hold_ms` (30 by default) — the run reports
+any release/press pair it could not fully separate as a `warning:` line rather
+than dropping the note silently.
+
+### Why not "just send digital note data"?
+
+A live Roblox experience exposes no MIDI port, socket or external note API.
+Luau runs in a sandbox fed by `UserInputService`; there is nothing outside the
+client to write note-on/note-off into. Sending real note data (exact durations,
+velocity, sustain, unlimited polyphony) is only possible if you **own the
+place**: add a Script that receives a data channel and calls the piano's own
+sound function directly. For a third-party experience like Virtual Piano there
+is no supported bridge — the honest ceiling for this tool is keyboard events
+(with `--midi-out` available when the target is a DAW/synth instead of Roblox).
 
 ## 🎛 MIDI output
 
@@ -145,7 +285,9 @@ the end of playback the app sends All Notes Off / All Sound Off — but only on
 the channels it actually used, so it will not silence a DAW's other tracks.
 
 In the menu bar app this is **Output ▸ Keyboard / Virtual MIDI port /
-*\<destination\>***, with *Rescan MIDI ports* to refresh the list.
+*\<destination\>***, with *Rescan MIDI ports* to refresh the list. The keyboard
+branch additionally has **Direct to Roblox (no focus needed)** (off by default),
+which targets the Roblox process instead of the active window.
 
 Two limits worth knowing: a virtual port only exists while playback is running
 (the receiving app has to be able to see new ports appear, which DAWs handle and
@@ -305,7 +447,9 @@ The parser handles the cases that make naive implementations sound wrong:
 ## 🤖 Humanization
 
 Every effect scales with `--humanize` (0 = exactly as written, 100 = full
-variation defined in the config):
+variation defined in the config). The default is **0**, in both the CLI and the
+menu bar app, so the first playback is always faithful to the MIDI file —
+humanization is strictly opt-in:
 
 - `timing_variation_ms` — random ±offset on each note start.
 - `duration_variation_ms` — random ±offset on each note length.
@@ -322,15 +466,89 @@ assumption — a sustain-pedal artefact, a note exported with an overlong
 duration, or the same pitch note-on'd three times on one tick. All of those
 used to make the *next* note on that key silently disappear.
 
-The player now normalises the schedule per key before it runs:
+**The keyboard layout makes this worse than it looks.** A sharp is the *same
+physical key* as the white note below it (`!` = Shift+`1`), and the outer
+octaves reuse those keys again with Ctrl (`Ctrl+1`). So a long-held C2 blocks
+not just the next C2 but also C#2 and A0 — notes of completely different
+pitches. On a dense arrangement that can cost hundreds of notes.
 
-- note-ons for the same key on the same millisecond collapse into one press;
-- a note that would still be held when the next one starts is trimmed at that
-  start, so the key is free for the retrigger.
+The player therefore normalises per **physical key** before it runs:
+
+- note-ons for the same physical key on the same millisecond collapse into one
+  press (two pitches on one key at one instant is genuinely impossible — the
+  run reports these);
+- a note that would still be held when the next one starts has its release
+  pulled back to `retrigger_gap_ms` (default 20) **before** that start.
+
+That last detail matters. Releasing at *exactly* the next note's start puts the
+key-up and the next key-down in one scheduler pass, back-to-back with no real
+time between them. Roblox samples `IsKeyDown` once per frame, so it can see only
+"still down" and never fires `InputBegan` for the second note — the key is
+logically free but musically lost. 20 ms is just over one 60 Hz frame. The
+release is clamped at `start + min_hold_ms` so no note becomes too short to
+register; if the two onsets are too close for both a full hold and a key-up
+window, playback reports the count as a `warning: N release/press pair(s)` line
+so it never fails quietly.
+
+Only the *end* of a note is ever changed. Note starts are copied verbatim, so
+timing stays exactly as written. For very dense passages you can additionally
+shorten long holds with `--max-hold-ms 300` (or `player.max_hold_ms` in the
+config); again, only releases move. MIDI output ignores both the cap and the
+retrigger gap and always sends the written duration. In Direct to Roblox mode
+the gap is widened automatically — see
+[Direct mode: why some notes used to be skipped](#direct-mode-why-some-notes-used-to-be-skipped).
 
 If anything still cannot be retriggered, playback ends with a
 `warning: N note(s) could not be retriggered` line instead of failing quietly.
 `--dry-run` reports the same thing, so you can check a file before playing it.
+
+## 🔍 Debugging playback
+
+A menu bar bundle launched with `open` has **stdout and stderr attached to
+`/dev/null`** — every warning the player produced was invisible. Debug logging
+writes to a file instead:
+
+- GUI: **Debug ▸ Log playback to file**, then **Debug ▸ Reveal Debug Log**.
+- CLI: `--trace`, or `PIANOMI_TRACE=1`; override the path with `--trace-log PATH`
+  or `PIANOMI_TRACE_LOG`.
+- Default location: `~/Library/Logs/Pianomi/trace.log` (Console.app and `less`
+  both read it; each line is flushed immediately, so a hang or OOM kill keeps
+  the tail).
+
+The header records the *effective* config, which is the whole point — in Direct
+mode the numbers differ from the TOML:
+
+```text
+# mode=Keys targeted=true dry_run=false
+# effective: retrigger_gap_ms=50 same_key_gap_ms=60 min_hold_ms=30 ...
+# song: notes=2383 length_ms=284159.0 loops=1 humanize=0
+# columns: E | scheduled_ms | actual_ms | drift_ms | kind | key_id | physical | held | dest
+E    272910.0    272913    +3.0  RELEASE   j    j    held=0  dest=pid:11853
+```
+
+What the columns are for:
+
+- **drift** (`actual - scheduled`): a positive spike means the playback thread
+  stalled. A steady drift was the old `pgrep`-on-the-hot-path bug.
+- **kind**: `PRESS` / `RELEASE` are posted events; `SUPPRESSED` is a note-on that
+  could not fire because the key was already held; `HELD_RELEASE` is a key-up
+  withheld because another note still owns the key; `DEFERRED` is a key-up that
+  arrived before its own key-down and was retried.
+- **physical**: the stripped key. Filter on it to audit the key-up gaps:
+
+```bash
+grep '^E' ~/Library/Logs/Pianomi/trace.log |
+  awk -F'\t' '$5=="RELEASE"{r[$7]=$2} $5=="PRESS"&&($7 in r){print $2-r[$7], $6, $7}' |
+  sort -n | head
+```
+
+Anything below ~17 ms is invisible to a 60 Hz `IsKeyDown` poll; in Direct mode
+aim for 50 ms. The run ends with a `# summary:` line carrying the same counters
+the UI reports.
+
+`--target-pid PID` points playback at any process, which is how the jitter table
+above was measured: run a tiny AppKit event receiver, post to its PID, and
+compare arrival times with the trace. It never touches Roblox.
 
 ## ⚠️ Important notes
 
