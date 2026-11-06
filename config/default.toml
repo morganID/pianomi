@@ -417,3 +417,15 @@ shift_mode = "key"
 # this without rebuilding. A missing folder just hides the menu.
 dir = "~/Documents/MIDI-Piano-Klasifikasi/Piano-Solo"
 
+# Optional curated list: one "<Group><TAB><filename>" line per song, e.g.
+#
+#     Chopin	chopin_ballade_3_(c)lubetsky.mid
+#
+# When this file exists it REPLACES the folder scan, which is what makes a big
+# dump of mostly obscure repertoire usable: the list knows the real composer,
+# while the filenames only start with the work ("preludes_…", "sonata_…"), so a
+# plain scan can only group by the first word. Songs you add yourself belong in
+# here too (group them as "Mine"). Edit the file to hide or add songs; leave the
+# setting empty to go back to listing the whole folder.
+allowlist = "~/Documents/MIDI-Piano-Klasifikasi/library-famous.txt"
+

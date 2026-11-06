@@ -126,6 +126,13 @@ pub struct LibraryConfig {
     /// which is the only way to change it without rebuilding the bundle.
     #[serde(default = "default_library_dir")]
     pub dir: String,
+    /// Optional curated list of `<Group><TAB><filename>` lines. When it exists
+    /// it replaces the plain folder scan, which is what makes a 2.5k-file dump
+    /// of mostly obscure repertoire usable: the list carries the composer, so
+    /// the menu can group by it instead of by the filename's first word.
+    /// Files named in it that no longer exist are skipped.
+    #[serde(default = "default_library_allowlist")]
+    pub allowlist: Option<String>,
 }
 
 impl LibraryConfig {
@@ -133,6 +140,15 @@ impl LibraryConfig {
     pub fn resolved_dir(&self) -> std::path::PathBuf {
         let raw = std::env::var("PIANOMI_LIBRARY").unwrap_or_else(|_| self.dir.clone());
         expand_tilde(&raw)
+    }
+
+    /// The curated list path, if configured.
+    pub fn resolved_allowlist(&self) -> Option<std::path::PathBuf> {
+        self.allowlist
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(expand_tilde)
     }
 }
 
@@ -151,6 +167,9 @@ fn default_library_dir() -> String {
     // Deliberately a plain path in the config rather than a constant in the
     // code: the Library is user content, so it belongs in the config file.
     "~/Documents/MIDI-Piano-Klasifikasi/Piano-Solo".to_string()
+}
+fn default_library_allowlist() -> Option<String> {
+    Some("~/Documents/MIDI-Piano-Klasifikasi/library-famous.txt".to_string())
 }
 fn default_f64_35() -> f64 {
     35.0
@@ -203,6 +222,7 @@ impl Default for LibraryConfig {
     fn default() -> Self {
         LibraryConfig {
             dir: default_library_dir(),
+            allowlist: default_library_allowlist(),
         }
     }
 }

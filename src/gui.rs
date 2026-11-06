@@ -168,7 +168,7 @@ impl Ui {
             for i in indices {
                 let item = MenuItem::with_id(
                     format!("libs{}", i),
-                    song_label(&self.library[i]),
+                    song_label(&self.library[i], &key),
                     true,
                     None,
                 );
@@ -651,12 +651,57 @@ fn group_label(key: &str) -> String {
 }
 
 /// Menu label for a song: filename without extension, underscores as spaces.
-fn song_label(path: &std::path::Path) -> String {
+/// The group name is stripped when the filename repeats it, because the
+/// submenu heading already says it ("Chopin ▸ ballade 3", not
+/// "Chopin ▸ chopin ballade 3").
+fn song_label(path: &std::path::Path, group: &str) -> String {
     let stem = path
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_default();
-    elide(&stem.replace('_', " "), 58)
+    let mut title = stem.replace('_', " ");
+    let prefix = format!("{} ", group.trim().to_lowercase());
+    if let Some(head) = title.get(..prefix.len()) {
+        if head.eq_ignore_ascii_case(&prefix) {
+            title = title[prefix.len()..].to_string();
+        }
+    }
+    elide(&title, 58)
+}
+
+/// Group used for songs that are not in the curated list's composer columns —
+/// i.e. the ones the user added themselves. Always sorted first.
+const MINE_GROUP: &str = "Mine";
+
+/// Read a curated `<Group>\t<filename>` list.
+///
+/// Returns `None` when the file is missing, so a typo in the config falls back
+/// to scanning the folder rather than silently showing an empty menu. Lines
+/// that are blank, start with `#`, or name a file that no longer exists are
+/// skipped.
+fn read_allowlist(list: &std::path::Path, dir: &std::path::Path) -> Option<Vec<(String, PathBuf)>> {
+    let text = std::fs::read_to_string(list).ok()?;
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let line = line.trim_end_matches('\r');
+        if line.trim().is_empty() || line.starts_with('#') {
+            continue;
+        }
+        // Tabs, not spaces: filenames are full of spaces.
+        let Some((group, name)) = line.split_once('\t') else {
+            continue;
+        };
+        let group = group.trim();
+        let name = name.trim();
+        if group.is_empty() || name.is_empty() {
+            continue;
+        }
+        let path = dir.join(name);
+        if path.is_file() {
+            out.push((group.to_string(), path));
+        }
+    }
+    Some(out)
 }
 
 /// Build a native-style (template) music-note icon for the menu bar.
@@ -744,18 +789,48 @@ fn main() -> anyhow::Result<()> {
     let m_dry = CheckMenuItem::with_id("dry", "Dry run (no keys)", true, false, None);
 
     // --- Library ----------------------------------------------------------
-    // Scanned once at start-up: the menu is built from a plain directory read,
-    // so a big collection costs one listing rather than one parse per file.
+    // Two sources. A curated `<Group>\t<filename>` list wins, because the
+    // Kunstderfuge dump is thousands of files of mostly obscure repertoire and
+    // its filenames start with the *work* (`preludes_…`, `sonata_…`), so a raw
+    // scan can only group by that first word. Without a list we fall back to
+    // scanning the folder and grouping by filename prefix.
     let library_dir = cfg.library.resolved_dir();
-    let library = scan_library(&library_dir);
+    let curated = cfg
+        .library
+        .resolved_allowlist()
+        .and_then(|list| read_allowlist(&list, &library_dir));
+
+    let (library, library_fill) = match curated {
+        Some(entries) => {
+            let mut library = Vec::new();
+            let mut by_group: std::collections::BTreeMap<String, Vec<usize>> =
+                std::collections::BTreeMap::new();
+            for (group, path) in entries {
+                let i = library.len();
+                library.push(path);
+                by_group.entry(group).or_default().push(i);
+            }
+            let mut fill: Vec<(String, Vec<usize>)> = by_group.into_iter().collect();
+            // "Mine" first: the songs you added yourself are the ones you are
+            // most likely to want, and they are the smallest group.
+            fill.sort_by_key(|(g, _)| (g != MINE_GROUP, g.clone()));
+            (library, fill)
+        }
+        None => {
+            let library = scan_library(&library_dir);
+            let mut by_group: std::collections::BTreeMap<String, Vec<usize>> =
+                std::collections::BTreeMap::new();
+            for (i, path) in library.iter().enumerate() {
+                by_group.entry(group_key(path)).or_default().push(i);
+            }
+            (library, by_group.into_iter().collect())
+        }
+    };
+
     let sub_library = Submenu::with_id("sub_library", "Library", true);
     let m_random = MenuItem::with_id("librnd", "Play random", !library.is_empty(), None);
     sub_library.append(&m_random)?;
     sub_library.append(&PredefinedMenuItem::separator())?;
-    // Group by the first word of the filename so 1000+ songs stay navigable
-    // instead of becoming one endless scrolling menu. The groups are turned
-    // into real menu items later, by `refresh`.
-    let mut library_fill = Vec::new();
     if library.is_empty() {
         sub_library.append(&MenuItem::with_id(
             "libnone",
@@ -766,13 +841,6 @@ fn main() -> anyhow::Result<()> {
             false,
             None,
         ))?;
-    } else {
-        let mut groups: std::collections::BTreeMap<String, Vec<usize>> =
-            std::collections::BTreeMap::new();
-        for (i, path) in library.iter().enumerate() {
-            groups.entry(group_key(path)).or_default().push(i);
-        }
-        library_fill = groups.into_iter().collect();
     }
 
     let sub_h = Submenu::with_id("sub_h", "Humanize", true);
@@ -1084,9 +1152,61 @@ mod tests {
     #[test]
     fn song_label_reads_like_a_title() {
         assert_eq!(
-            song_label(Path::new("/x/dussek_sonata_45_2_1_(c)iscenko.mid")),
-            "dussek sonata 45 2 1 (c)iscenko"
+            song_label(
+                Path::new("/x/dussek_sonata_45_2_1_(c)iscenko.mid"),
+                "Dussek"
+            ),
+            "sonata 45 2 1 (c)iscenko"
         );
+        // The group is only stripped when the filename actually repeats it.
+        assert_eq!(
+            song_label(Path::new("/x/ABBA - The Winner.mid"), "Mine"),
+            "ABBA - The Winner"
+        );
+    }
+
+    #[test]
+    fn allowlist_parses_groups_and_skips_junk() {
+        let dir = std::env::temp_dir().join(format!("pianomi-allow-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a_song.mid"), b"x").unwrap();
+        std::fs::write(dir.join("b song.mid"), b"x").unwrap();
+
+        let list = dir.join("list.txt");
+        std::fs::write(
+            &list,
+            "# comment\n\nChopin\ta_song.mid\nMine\tb song.mid\nChopin\tmissing.mid\nbogus line\n",
+        )
+        .unwrap();
+
+        let got = read_allowlist(&list, &dir).unwrap();
+        let flat: Vec<(String, String)> = got
+            .iter()
+            .map(|(g, p)| {
+                (
+                    g.clone(),
+                    p.file_name().unwrap().to_string_lossy().into_owned(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            flat,
+            vec![
+                ("Chopin".to_string(), "a_song.mid".to_string()),
+                // A filename with spaces must survive, and a listed-but-missing
+                // file must be dropped rather than shown as a dead menu item.
+                ("Mine".to_string(), "b song.mid".to_string()),
+            ]
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn missing_allowlist_falls_back_to_scanning() {
+        let dir = std::env::temp_dir().join("pianomi-no-such-list-xyz");
+        assert!(read_allowlist(&dir.join("nope.txt"), &dir).is_none());
     }
 
     #[test]
