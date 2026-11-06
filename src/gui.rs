@@ -3,12 +3,13 @@
 //!
 //! Instead of a normal window it lives in the menu bar (top-right). Click the
 //! piano icon to get a dropdown with:
-//!   * Open MIDI…            (native file dialog)
+//!   * Open MIDI… (native file dialog)
+//!   * Library (play random, or browse a folder of songs)
 //!   * Song / status info
-//!   * Play / Stop           (playback on a worker thread, stoppable)
+//!   * Play / Stop (one toggle; playback runs on a worker thread)
 //!   * Dry run toggle
-//!   * Humanize / Speed / Transpose / Loops presets
-//!   * Output                 (keyboard, virtual MIDI port, or a destination)
+//!   * Settings ▸ (humanize, speed, transpose, loops, sharp keys, output
+//!     routing, debug)
 //!   * Quit
 //!
 //! The Dock icon is hidden via `LSUIElement` + the Accessory activation policy,
@@ -71,6 +72,8 @@ struct Ui {
     cfg: Config,
     song: Option<Song>,
     file_name: String,
+    /// Path of the song in `song`, so "Play random" can avoid repeating it.
+    current_path: Option<PathBuf>,
 
     humanize: u8,
     speed: f32,
@@ -86,23 +89,28 @@ struct Ui {
     _tray: TrayIcon,
     m_song: MenuItem,
     m_status: MenuItem,
-    m_play: MenuItem,
-    m_stop: MenuItem,
+    /// One item that reads "Play" when idle and "Stop" while a song runs.
+    m_toggle: MenuItem,
     m_dry: CheckMenuItem,
     m_humanize: Vec<(u8, CheckMenuItem)>,
     m_speed: Vec<(f32, CheckMenuItem)>,
     m_transpose: Vec<(i8, CheckMenuItem)>,
     m_loops: Vec<(u32, CheckMenuItem)>,
     m_sharp: Vec<(String, CheckMenuItem)>,
+    /// Every song offered by the Library menu. Item ids are `libs<index>` into
+    /// this vector, so the path never has to be encoded in a menu id.
+    library: Vec<PathBuf>,
+    /// The Library menu itself, so groups can be appended after start-up.
+    sub_library: Submenu,
+    /// Groups still waiting to be turned into submenus, drained a few per
+    /// event-loop tick. See `refresh` for why this is not done up front.
+    library_fill: std::vec::IntoIter<(String, Vec<usize>)>,
+    /// A song that should start as soon as the previous one has stopped.
+    pending_play: Option<PathBuf>,
     /// Output routing.
     out: OutChoice,
     m_out_keys: CheckMenuItem,
     m_out_virt: CheckMenuItem,
-    /// Opt-in: post key events straight to the Roblox process instead of the
-    /// global HID tap. OFF by default — the system-wide path is the one that
-    /// has been verified in game and has no per-event PID lookup overhead.
-    direct_roblox: bool,
-    m_direct: CheckMenuItem,
     /// Live list of MIDI destinations, rebuilt by "Rescan".
     m_out_dests: Vec<(String, CheckMenuItem)>,
     /// Monotonic id counter for destination menu items.
@@ -132,8 +140,46 @@ impl Ui {
             (s.playing, s.status.clone())
         };
         self.m_status.set_text(&status);
-        self.m_play.set_enabled(!playing && self.song.is_some());
-        self.m_stop.set_enabled(playing);
+        // One item, two jobs: the label is the action you can take right now.
+        self.m_toggle
+            .set_text(if playing { "Stop" } else { "Play" });
+        self.m_toggle.set_enabled(playing || self.song.is_some());
+
+        // A library pick that arrived mid-song waits here until the worker
+        // reports idle, so "choose another song" never needs two clicks.
+        if !playing {
+            if let Some(path) = self.pending_play.take() {
+                if self.load(path) {
+                    self.start_play();
+                }
+            }
+        }
+
+        // Building the whole Library up front costs about a second for a few
+        // thousand songs (measured: 973 ms release / 1.46 s debug for 2255
+        // items) and would delay the status item appearing. A dozen groups per
+        // tick keeps each pass under ~100 ms and the menu is complete within a
+        // second of launch.
+        for _ in 0..12 {
+            let Some((key, indices)) = self.library_fill.next() else {
+                break;
+            };
+            let sub = Submenu::with_id(format!("libg{}", key), group_label(&key), true);
+            for i in indices {
+                let item = MenuItem::with_id(
+                    format!("libs{}", i),
+                    song_label(&self.library[i]),
+                    true,
+                    None,
+                );
+                if let Err(e) = sub.append(&item) {
+                    eprintln!("library menu: {e}");
+                }
+            }
+            if let Err(e) = self.sub_library.append(&sub) {
+                eprintln!("library menu: {e}");
+            }
+        }
     }
 
     fn pick_file(&mut self) {
@@ -149,7 +195,9 @@ impl Ui {
         }
     }
 
-    fn load(&mut self, path: PathBuf) {
+    /// Parse `path` into `self.song`. Returns `false` on a parse error, so a
+    /// caller that meant to play it can leave the previous song alone.
+    fn load(&mut self, path: PathBuf) -> bool {
         match midi_parser::parse_midi(&path) {
             Ok(song) => {
                 self.file_name = path
@@ -158,15 +206,58 @@ impl Ui {
                     .unwrap_or_default();
                 let n = song.notes.len();
                 self.song = Some(song);
-                self.m_song
-                    .set_text(format!("Song: {} ({} notes)", self.file_name, n));
-                self.m_play.set_enabled(true);
+                self.current_path = Some(path);
+                self.m_song.set_text(format!(
+                    "Song: {} ({} notes)",
+                    elide(&self.file_name, 44),
+                    n
+                ));
+                self.m_toggle.set_enabled(true);
                 self.set_status(&format!("Loaded {}", self.file_name));
+                true
             }
             Err(e) => {
                 self.set_status(&format!("Parse error: {}", e));
+                false
             }
         }
+    }
+
+    /// Load `path` and start it. If a song is still winding down, remember the
+    /// request and let `refresh` start it once the worker reports idle.
+    fn request_play(&mut self, path: PathBuf) {
+        let playing = self.shared.lock().map(|s| s.playing).unwrap_or(false);
+        if !self.load(path.clone()) {
+            return;
+        }
+        if playing {
+            self.stop.store(true, Ordering::SeqCst);
+            self.pending_play = Some(path);
+            self.set_status("Stopping, then playing the new song…");
+        } else {
+            self.start_play();
+        }
+    }
+
+    /// Pick a song from the library uniformly at random, skipping whatever is
+    /// already loaded so the button always visibly does something.
+    fn play_random(&mut self) {
+        if self.library.is_empty() {
+            self.set_status("Library is empty");
+            return;
+        }
+        let mut idx = rand::random::<usize>() % self.library.len();
+        if self.library.len() > 1 {
+            // Bounded retry rather than a filtered draw: with one file loaded
+            // out of N, a few tries is cheaper than building a second vector.
+            for _ in 0..8 {
+                if Some(&self.library[idx]) != self.current_path.as_ref() {
+                    break;
+                }
+                idx = rand::random::<usize>() % self.library.len();
+            }
+        }
+        self.request_play(self.library[idx].clone());
     }
 
     fn start_play(&mut self) {
@@ -201,21 +292,17 @@ impl Ui {
         let spec = self.out.spec();
         stop.store(false, Ordering::SeqCst);
 
-        // Opt-in: scope keyboard events to the Roblox process. OFF by default
-        // because the system-wide HID path is the one verified in game; targeted
-        // posting queues events in Roblox's event loop and can shift timing.
-        // When Roblox is not running we fall back to the focused window rather
-        // than silently dropping the whole song.
-        //
-        // `targeted` is the *resolved* truth (Roblox actually found), because
-        // the scheduler must widen its key-up margins only when events really
-        // travel through CGEventPostToPid. Getting this wrong either loses notes
-        // in Direct mode or needlessly shortens notes on the HID path.
+        // Direct-to-Roblox is not a choice any more: keyboard playback always
+        // scopes its events to the Roblox process when it is running, and falls
+        // back to the focused window otherwise. `targeted` below is the
+        // *resolved* truth, because the scheduler must widen its key-up margins
+        // only when events really travel through CGEventPostToPid. Getting this
+        // wrong either loses notes in Direct mode or needlessly shortens notes
+        // on the HID path.
         #[cfg(target_os = "macos")]
         let targeted = {
             use pianomi::keycode;
-            let direct = self.direct_roblox && mode == OutputMode::Keys && !dry;
-            if direct {
+            if mode == OutputMode::Keys && !dry {
                 keycode::set_event_target_roblox(true);
                 if keycode::event_target_pid() <= 0 {
                     keycode::set_event_target_roblox(false);
@@ -318,11 +405,16 @@ impl Ui {
     fn on_menu(&mut self, id: &str) {
         match id {
             "open" => self.pick_file(),
-            "play" => self.start_play(),
-            "stop" => {
-                self.stop.store(true, Ordering::SeqCst);
-                self.set_status("Stopping…");
+            "toggle" => {
+                let playing = self.shared.lock().map(|s| s.playing).unwrap_or(false);
+                if playing {
+                    self.stop.store(true, Ordering::SeqCst);
+                    self.set_status("Stopping…");
+                } else {
+                    self.start_play();
+                }
             }
+            "librnd" => self.play_random(),
             "dry" => {
                 self.dry_run = self.m_dry.is_checked();
             }
@@ -382,15 +474,18 @@ impl Ui {
                     Err(e) => self.set_status(&format!("Could not reveal log: {e}")),
                 }
             }
-            "outdirect" => {
-                self.direct_roblox = self.m_direct.is_checked();
-                self.set_status(if self.direct_roblox {
-                    "Keys go straight to Roblox (focus independent)"
-                } else {
-                    "Keys go to the focused window"
-                });
-            }
             _ => {
+                // A song picked from the Library menu: the id is the index into
+                // `library`, so the path never has to survive a round trip
+                // through a menu id.
+                if let Some(v) = id.strip_prefix("libs") {
+                    if let Ok(i) = v.parse::<usize>() {
+                        if let Some(path) = self.library.get(i).cloned() {
+                            self.request_play(path);
+                        }
+                    }
+                    return;
+                }
                 // A MIDI destination picked from the rescan list. Looked up by
                 // the item's own id, so a rescan can renumber freely.
                 if id.starts_with("od") {
@@ -487,6 +582,83 @@ fn note_inside(px: f64, py: f64) -> bool {
     false
 }
 
+/// Shorten `s` to at most `max` characters, appending an ellipsis when it had
+/// to be cut. Used for menu labels: macOS clips long items anyway, and a
+/// clipped label loses the part that identifies the file.
+fn elide(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let cut: String = s.chars().take(max.saturating_sub(1)).collect();
+    format!("{}…", cut)
+}
+
+/// Every `.mid` / `.midi` file directly inside `dir`, sorted by filename.
+/// A missing or unreadable folder yields an empty list rather than an error:
+/// the Library menu is a convenience, not a requirement.
+fn scan_library(dir: &std::path::Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if ext == "mid" || ext == "midi" {
+            out.push(path);
+        }
+    }
+    out.sort_by(|a, b| {
+        a.file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_lowercase()
+            .cmp(
+                &b.file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_lowercase(),
+            )
+    });
+    out
+}
+
+/// Grouping key for a song: the first `_`-separated word of its filename.
+/// The library is named `<work or composer>_<rest>`, so this is what makes
+/// "chopin_ballade_1" land under Chopin.
+fn group_key(path: &std::path::Path) -> String {
+    let stem = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    stem.split('_').next().unwrap_or(&stem).to_ascii_lowercase()
+}
+
+/// Menu label for a group key: just the first letter capitalised.
+fn group_label(key: &str) -> String {
+    let mut chars = key.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+        None => String::from("?"),
+    }
+}
+
+/// Menu label for a song: filename without extension, underscores as spaces.
+fn song_label(path: &std::path::Path) -> String {
+    let stem = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    elide(&stem.replace('_', " "), 58)
+}
+
 /// Build a native-style (template) music-note icon for the menu bar.
 /// Rendered black with anti-aliased alpha; macOS recolors it automatically
 /// when `with_icon_as_template(true)` is set.
@@ -568,9 +740,40 @@ fn main() -> anyhow::Result<()> {
     let m_open = MenuItem::with_id("open", "Open MIDI…", true, None);
     let m_song = MenuItem::with_id("song", "Song: (none)", false, None);
     let m_status = MenuItem::with_id("status", "Ready", false, None);
-    let m_play = MenuItem::with_id("play", "Play", false, None);
-    let m_stop = MenuItem::with_id("stop", "Stop", false, None);
+    let m_toggle = MenuItem::with_id("toggle", "Play", false, None);
     let m_dry = CheckMenuItem::with_id("dry", "Dry run (no keys)", true, false, None);
+
+    // --- Library ----------------------------------------------------------
+    // Scanned once at start-up: the menu is built from a plain directory read,
+    // so a big collection costs one listing rather than one parse per file.
+    let library_dir = cfg.library.resolved_dir();
+    let library = scan_library(&library_dir);
+    let sub_library = Submenu::with_id("sub_library", "Library", true);
+    let m_random = MenuItem::with_id("librnd", "Play random", !library.is_empty(), None);
+    sub_library.append(&m_random)?;
+    sub_library.append(&PredefinedMenuItem::separator())?;
+    // Group by the first word of the filename so 1000+ songs stay navigable
+    // instead of becoming one endless scrolling menu. The groups are turned
+    // into real menu items later, by `refresh`.
+    let mut library_fill = Vec::new();
+    if library.is_empty() {
+        sub_library.append(&MenuItem::with_id(
+            "libnone",
+            format!(
+                "(no .mid files in {})",
+                elide(&library_dir.display().to_string(), 48)
+            ),
+            false,
+            None,
+        ))?;
+    } else {
+        let mut groups: std::collections::BTreeMap<String, Vec<usize>> =
+            std::collections::BTreeMap::new();
+        for (i, path) in library.iter().enumerate() {
+            groups.entry(group_key(path)).or_default().push(i);
+        }
+        library_fill = groups.into_iter().collect();
+    }
 
     let sub_h = Submenu::with_id("sub_h", "Humanize", true);
     let mut m_humanize = Vec::new();
@@ -629,6 +832,8 @@ fn main() -> anyhow::Result<()> {
         m_sharp.push((val.to_string(), it));
     }
 
+    // Output routing. Keyboard playback always targets the Roblox process (see
+    // `start_play`), so there is nothing to toggle here.
     let sub_out = Submenu::with_id("sub_out", "Output", true);
     let m_out_keys = CheckMenuItem::with_id("outkeys", "Keyboard (Roblox piano)", true, true, None);
     let m_out_virt = CheckMenuItem::with_id(
@@ -638,15 +843,7 @@ fn main() -> anyhow::Result<()> {
         false,
         None,
     );
-    let m_direct = CheckMenuItem::with_id(
-        "outdirect",
-        "Direct to Roblox (no focus needed)",
-        true,
-        false,
-        None,
-    );
     sub_out.append(&m_out_keys)?;
-    sub_out.append(&m_direct)?;
     sub_out.append(&PredefinedMenuItem::separator())?;
     sub_out.append(&m_out_virt)?;
     sub_out.append(&PredefinedMenuItem::separator())?;
@@ -696,25 +893,36 @@ fn main() -> anyhow::Result<()> {
     sub_dbg.append(&m_trace)?;
     sub_dbg.append(&m_reveal)?;
 
+    // Everything that shapes playback or routing lives one level down, so the
+    // menu itself stays six items tall: open, library, play, dry run, settings,
+    // quit. Inside Settings the groups are: how notes are shaped, where they
+    // go, and debugging.
+    let sub_settings = Submenu::with_id("sub_settings", "Settings", true);
+    sub_settings.append_items(&[
+        &sub_h,
+        &sub_s,
+        &sub_t,
+        &sub_l,
+        &PredefinedMenuItem::separator(),
+        &sub_sh,
+        &sub_out,
+        &PredefinedMenuItem::separator(),
+        &sub_dbg,
+    ])?;
+
     let menu = Menu::new();
     menu.append_items(&[
         &title,
         &PredefinedMenuItem::separator(),
         &m_open,
+        &sub_library,
         &m_song,
         &m_status,
         &PredefinedMenuItem::separator(),
-        &m_play,
-        &m_stop,
+        &m_toggle,
         &m_dry,
         &PredefinedMenuItem::separator(),
-        &sub_h,
-        &sub_s,
-        &sub_t,
-        &sub_l,
-        &sub_sh,
-        &sub_out,
-        &sub_dbg,
+        &sub_settings,
         &PredefinedMenuItem::separator(),
         &PredefinedMenuItem::quit(Some("Quit Pianomi")),
     ])?;
@@ -734,6 +942,7 @@ fn main() -> anyhow::Result<()> {
         cfg,
         song: None,
         file_name: String::new(),
+        current_path: None,
         // 0 = play the file exactly as written. Humanization is opt-in: the
         // default must not silently alter timing/velocity before the user has
         // even heard the song once.
@@ -750,19 +959,20 @@ fn main() -> anyhow::Result<()> {
         _tray: tray,
         m_song,
         m_status,
-        m_play,
-        m_stop,
+        m_toggle,
         m_dry,
         m_humanize,
         m_speed,
         m_transpose,
         m_loops,
         m_sharp,
+        library,
+        sub_library,
+        library_fill: library_fill.into_iter(),
+        pending_play: None,
         out: OutChoice::Keys,
         m_out_keys,
         m_out_virt,
-        direct_roblox: false,
-        m_direct,
         m_out_dests,
         out_seq,
         sub_out,
@@ -836,4 +1046,72 @@ fn main() -> anyhow::Result<()> {
             restore_pending = true;
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn elide_leaves_short_strings_alone() {
+        assert_eq!(elide("abc", 10), "abc");
+        assert_eq!(elide("abcdefghij", 10), "abcdefghij");
+    }
+
+    #[test]
+    fn elide_cuts_to_the_limit_and_marks_it() {
+        let out = elide("abcdefghijklmno", 10);
+        assert_eq!(out.chars().count(), 10);
+        assert!(out.ends_with('…'), "got {out:?}");
+    }
+
+    #[test]
+    fn group_key_is_the_first_underscore_word() {
+        assert_eq!(group_key(Path::new("/x/chopin_ballade_1.mid")), "chopin");
+        assert_eq!(group_key(Path::new("/x/Nocturne_2.MID")), "nocturne");
+        // No underscore at all: the whole stem is the key.
+        assert_eq!(group_key(Path::new("/x/Zambra.mid")), "zambra");
+    }
+
+    #[test]
+    fn group_label_capitalises_only_the_first_letter() {
+        assert_eq!(group_label("chopin"), "Chopin");
+        assert_eq!(group_label("abba - the winner"), "Abba - the winner");
+        assert_eq!(group_label(""), "?");
+    }
+
+    #[test]
+    fn song_label_reads_like_a_title() {
+        assert_eq!(
+            song_label(Path::new("/x/dussek_sonata_45_2_1_(c)iscenko.mid")),
+            "dussek sonata 45 2 1 (c)iscenko"
+        );
+    }
+
+    #[test]
+    fn scan_library_takes_only_midi_files() {
+        let dir = std::env::temp_dir().join(format!("pianomi-lib-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for name in ["b_song.mid", "a_song.MIDI", "notes.txt", "cover.png"] {
+            std::fs::write(dir.join(name), b"x").unwrap();
+        }
+        // A directory named like a MIDI file must not be listed.
+        std::fs::create_dir_all(dir.join("c_trap.mid")).unwrap();
+
+        let found: Vec<String> = scan_library(&dir)
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(found, vec!["a_song.MIDI", "b_song.mid"]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn scan_library_tolerates_a_missing_folder() {
+        let missing = std::env::temp_dir().join("pianomi-does-not-exist-xyz");
+        assert!(scan_library(&missing).is_empty());
+    }
 }

@@ -10,15 +10,23 @@
 #   rebuild. Grant it once and forget about it.
 #
 # Usage:
-#   ./run-gui.sh                 # icon appears in the menu bar, song preloaded
-#   ./run-gui.sh other.mid
+#   ./run-gui.sh                 # icon appears in the menu bar; pick a song
+#                                # from the Library menu
+#   ./run-gui.sh other.mid       # preload a specific file
 #
 # The terminal stays attached (the app's event loop runs in the foreground).
 # Press Ctrl+C to quit.
 set -euo pipefail
 cd "$(dirname "$0")"
 
-SONG="${1:-Spring_Thief.mid}"
+# No song argument is fine: the Library menu is the normal way to pick one.
+# Only pass a path on if it actually exists, otherwise the app would start
+# with a "Parse error" in the status line.
+SONG="${1:-}"
+if [ -n "$SONG" ] && [ ! -f "$SONG" ]; then
+  echo "warning: $SONG not found — starting without a preloaded song"
+  SONG=""
+fi
 
 # --- Accessibility pre-flight -------------------------------------------
 # AXIsProcessTrusted() reflects the *responsible* app (our terminal), not the
@@ -64,5 +72,11 @@ else
 fi
 
 echo "Starting menu bar app — look for the music-note icon at the top-right."
-echo "Song: $SONG   |   Press Ctrl+C here to quit."
-exec "$BIN" "$SONG"
+echo "Press Ctrl+C here to quit."
+
+if [ -n "$SONG" ]; then
+  echo "Preloaded: $SONG"
+  exec "$BIN" "$SONG"
+else
+  exec "$BIN"
+fi

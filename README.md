@@ -31,6 +31,8 @@ Ships as a **CLI** and a **macOS menu bar app**.
 - **Loop, channel filter, transpose, speed** from the CLI.
 - **Key-coverage report** — tells you up front whether a file is playable with
   your mapping, and which pitches are not.
+- **Menu bar library** — point it at a folder of songs, then pick one or hit
+  *Play random*; no file dialog per song.
 
 ## 🚀 Build
 
@@ -57,16 +59,42 @@ survives rebuilds (an ad-hoc signature would reset it on every build).
 
 The menu bar app never takes focus away from the game: tao's launch-time
 activation is disabled, and after a menu click or the Open MIDI dialog focus is
-handed back to the app that was frontmost before. Keyboard playback keeps the
-verified system-wide HID path by default. **Output ▸ Direct to Roblox (no focus
-needed)** is an optional toggle: it posts straight to the Roblox process
-(`CGEventPostToPid`), so notes land even when another app is active and never
-leak into a text field. Targeted events are now stamped with real, strictly
-increasing timestamps (see below), which fixes the coalescing/delay they used
-to cause; it is still off by default because Roblox's run loop has to drain
-those events, making the HID path the more predictable timing reference.
-Humanize starts at **0%** (exact playback); pick a level under **Humanize** to
-opt in.
+handed back to the app that was frontmost before.
+
+Keyboard playback **always targets the Roblox process** — there is no toggle to
+forget. Notes are posted with `CGEventPostToPid` straight into Roblox, so they
+land even when another app is active and never leak into a text field. When
+Roblox is not running, playback falls back to the focused window and the status
+line says so. Targeted events are stamped with real, strictly increasing
+timestamps (see below), which fixed the coalescing/delay they used to cause.
+
+The menu stays short:
+
+```text
+Open MIDI…
+Library ▸        Play random, or a folder of songs grouped by name
+Song: …          what is loaded, and how many notes
+Ready            what is happening right now
+─────────────────
+Play             one toggle: reads "Stop" while a song runs
+Dry run (no keys)
+─────────────────
+Settings ▸       Humanize, Speed, Transpose, Loops, Sharp keys,
+                 Output, Debug
+Quit Pianomi
+```
+
+**Library** points at a folder of `.mid` files (see `[library]` in
+`config/default.toml`, or set `PIANOMI_LIBRARY`). Picking a song loads *and*
+starts it; picking one while something else is playing stops that first and
+then plays the new one. **Play random** draws uniformly from the whole folder
+and skips whatever is already loaded, so it always visibly does something.
+Songs are grouped by the first word of the filename (`chopin_ballade_3` →
+**Chopin**), which keeps a few thousand files navigable; the groups are filled
+in over the first second after launch so the icon appears immediately.
+
+Humanize starts at **0%** (exact playback); pick a level under **Settings ▸
+Humanize** to opt in.
 
 
 ## 🎮 Usage
@@ -201,7 +229,7 @@ di-skip" symptom — timing, not missing events.
 
 So Direct mode automatically widens the gap that the game can actually see:
 
-| Margin | HID (default) | Direct to Roblox |
+| Margin | HID (CLI default) | Direct to Roblox (GUI always) |
 | --- | --- | --- |
 | key-up before the next press on one physical key | 20 ms | **50 ms** (20 + 30, linear) |
 | two pitches sharing one key on the same tick | 30 ms, raised to `min_hold_ms + retrigger_gap_ms` (= 50 ms) | 60 ms floor, raised to `min_hold_ms + retrigger_gap_ms` (**= 80 ms** with defaults) |
@@ -264,6 +292,11 @@ files may also need a smaller `min_hold_ms` (30 by default) — the run reports
 any release/press pair it could not fully separate as a `warning:` line rather
 than dropping the note silently.
 
+The CLI keeps Direct mode opt-in (`--target-roblox`) so both transports stay
+comparable. The **menu bar app always uses it** — no toggle to forget, and no
+way to accidentally play into whatever window happens to be focused. If you
+need the HID path there, use the CLI.
+
 ### Why not "just send digital note data"?
 
 A live Roblox experience exposes no MIDI port, socket or external note API.
@@ -303,10 +336,9 @@ tempo map, all 128 pitches, and a real `0x80` note-off per note. On stop or at
 the end of playback the app sends All Notes Off / All Sound Off — but only on
 the channels it actually used, so it will not silence a DAW's other tracks.
 
-In the menu bar app this is **Output ▸ Keyboard / Virtual MIDI port /
+In the menu bar app this is **Settings ▸ Output ▸ Keyboard / Virtual MIDI port /
 *\<destination\>***, with *Rescan MIDI ports* to refresh the list. The keyboard
-branch additionally has **Direct to Roblox (no focus needed)** (off by default),
-which targets the Roblox process instead of the active window.
+branch always targets the Roblox process; MIDI output ignores that entirely.
 
 Two limits worth knowing: a virtual port only exists while playback is running
 (the receiving app has to be able to see new ports appear, which DAWs handle and
@@ -527,7 +559,8 @@ A menu bar bundle launched with `open` has **stdout and stderr attached to
 `/dev/null`** — every warning the player produced was invisible. Debug logging
 writes to a file instead:
 
-- GUI: **Debug ▸ Log playback to file**, then **Debug ▸ Reveal Debug Log**.
+- GUI: **Settings ▸ Debug ▸ Log playback to file**, then **Settings ▸ Debug ▸
+  Reveal Debug Log**.
 - CLI: `--trace`, or `PIANOMI_TRACE=1`; override the path with `--trace-log PATH`
   or `PIANOMI_TRACE_LOG`.
 - Default location: `~/Library/Logs/Pianomi/trace.log` (Console.app and `less`

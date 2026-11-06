@@ -406,3 +406,14 @@ loop_gap_ms = 800
 # every white key pressed in the meantime into a sharp.
 shift_mode = "key"
 
+# ---------------------------------------------------------------------------
+# Library (menu bar app only)
+# ---------------------------------------------------------------------------
+[library]
+# Folder scanned one level deep for .mid / .midi files and offered under
+# "Library" in the menu bar. Files are grouped by the first word of their name
+# ("chopin_ballade_1" -> Chopin), so a large collection stays navigable.
+# A leading ~/ expands to your home folder. Set PIANOMI_LIBRARY to override
+# this without rebuilding. A missing folder just hides the menu.
+dir = "~/Documents/MIDI-Piano-Klasifikasi/Piano-Solo"
+

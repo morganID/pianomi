@@ -111,9 +111,47 @@ pub struct Config {
     pub humanize: HumanizeConfig,
     #[serde(default)]
     pub player: PlayerConfig,
+    #[serde(default)]
+    pub library: LibraryConfig,
+}
+
+/// Where the menu bar app's **Library** menu looks for songs.
+///
+/// Only the GUI uses this; the CLI takes an explicit `--file`. A missing or
+/// empty folder simply hides the Library menu, so this never blocks playback.
+#[derive(Debug, Clone, Deserialize)]
+pub struct LibraryConfig {
+    /// Folder scanned (one level deep) for `.mid` / `.midi` files. A leading
+    /// `~/` is expanded to the home directory. `PIANOMI_LIBRARY` overrides it,
+    /// which is the only way to change it without rebuilding the bundle.
+    #[serde(default = "default_library_dir")]
+    pub dir: String,
+}
+
+impl LibraryConfig {
+    /// The configured folder, with `~` expanded and the env override applied.
+    pub fn resolved_dir(&self) -> std::path::PathBuf {
+        let raw = std::env::var("PIANOMI_LIBRARY").unwrap_or_else(|_| self.dir.clone());
+        expand_tilde(&raw)
+    }
+}
+
+/// Expand a leading `~/` against `$HOME`. Anything else is returned as-is.
+fn expand_tilde(raw: &str) -> std::path::PathBuf {
+    if let Some(rest) = raw.strip_prefix("~/") {
+        if let Some(home) = std::env::var_os("HOME") {
+            return std::path::PathBuf::from(home).join(rest);
+        }
+    }
+    std::path::PathBuf::from(raw)
 }
 
 // --- defaults for optional fields ------------------------------------------
+fn default_library_dir() -> String {
+    // Deliberately a plain path in the config rather than a constant in the
+    // code: the Library is user content, so it belongs in the config file.
+    "~/Documents/MIDI-Piano-Klasifikasi/Piano-Solo".to_string()
+}
 fn default_f64_35() -> f64 {
     35.0
 }
@@ -157,6 +195,14 @@ impl Default for HumanizeConfig {
             duration_variation_ms: default_f64_25(),
             chord_delay_ms: default_f64_18(),
             use_velocity_for_duration: default_true(),
+        }
+    }
+}
+
+impl Default for LibraryConfig {
+    fn default() -> Self {
+        LibraryConfig {
+            dir: default_library_dir(),
         }
     }
 }
@@ -220,5 +266,34 @@ impl Config {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tilde_expands_against_home() {
+        let home = std::env::var("HOME").expect("HOME is always set on macOS/Linux");
+        assert_eq!(
+            expand_tilde("~/Music/songs"),
+            std::path::PathBuf::from(home).join("Music/songs")
+        );
+    }
+
+    #[test]
+    fn absolute_paths_are_left_alone() {
+        assert_eq!(
+            expand_tilde("/tmp/songs"),
+            std::path::PathBuf::from("/tmp/songs")
+        );
+    }
+
+    #[test]
+    fn library_dir_resolves_to_an_absolute_path() {
+        let lib = LibraryConfig::default();
+        assert!(!lib.dir.is_empty());
+        assert!(lib.resolved_dir().is_absolute());
     }
 }
